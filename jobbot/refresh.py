@@ -1,25 +1,29 @@
 """Refresh (Component B): poll each company's ATS public JSON, filter to student
-tech roles, upsert into listings. Runs 2x/day in production.
+tech roles, upsert into listings.
+
+Two profiles share one engine (see Policy):
+  * FAST  — runs 2x/day. Speed-first: small retry budget, low circuit-breaker
+            threshold, batch-write at the end. Finishes in minutes.
+  * DEEP  — runs nightly with hours of leeway. Completeness-first: patient retries,
+            high trip threshold (still gives up on a truly-dead host so it can't
+            grind for hours), and incremental flushing so a long run survives a
+            crash. Reclaims the per-run completeness/durability that FAST trades away.
 
 Concurrency — a work-conserving, host-aware scheduler (no worker blocks for long):
   * SHARED-host companies (path-based ATSs: greenhouse/lever/ashby/smartrecruiters/
     workable/rippling — every company of one ATS hits ONE API host) are capped at
-    PER_HOST_CAP in flight per host and dispatched round-robin. Calibration showed
-    these hosts tolerate >=24 concurrent with 0% 429, so 12 is polite AND fast.
-  * UNIQUE-host companies (subdomain ATSs: breezy/recruitee/teamtailor — each
-    company is its own host) flow through a free queue any idle worker drains.
-  * A worker only waits when EVERY shared host is at its cap AND the free queue is
-    empty, so freed workers immediately grab whatever's runnable — the design
-    auto-adapts if the host mix shifts (no static pool sizes to retune).
-  * Circuit breaker: a shared host that returns TRIP_AFTER consecutive failures
-    (e.g. an IP-level 429 block like workable hit locally) is tripped and its
-    remaining companies skipped for the run, so one bad host can't drag the job.
-
-All Supabase writes are batched on the main thread after polling.
+    Policy.per_host in flight per host and dispatched round-robin (calibration: these
+    hosts tolerate >=24 concurrent with 0% 429).
+  * UNIQUE-host companies (subdomain ATSs: breezy/recruitee/teamtailor — each company
+    is its own host) flow through a free queue any idle worker drains.
+  * A worker only waits when EVERY shared host is at cap AND the free queue is empty.
+  * Circuit breaker: a shared host with Policy.trip_after consecutive failures is
+    tripped and its remaining companies skipped for the run.
 """
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import requests
@@ -34,8 +38,29 @@ _UA = {"User-Agent": "job-bot/0.1 (+https://github.com/Akhatri98/Job-Bot)",
        "Accept": "application/json"}
 _local = threading.local()
 
-PER_HOST_CAP = 12   # in-flight per shared host (calibrated: hosts tolerate >=24, 0% 429)
-TRIP_AFTER = 8      # consecutive shared-host failures -> skip its remaining this run
+
+@dataclass(frozen=True)
+class Policy:
+    workers: int = 60
+    per_host: int = 12          # in-flight per shared host
+    attempts: int = 2           # tries per request (conn/timeout/429/5xx)
+    timeout: int = 12           # per-request seconds
+    backoff: float = 0.5        # base backoff for 429/5xx
+    conn_backoff: float = 0.3   # base backoff for connection/timeout
+    trip_after: int = 8         # consecutive shared-host failures -> trip (skip rest)
+    flush_interval: float = 0   # >0 -> flush to DB every N seconds; 0 -> batch at end
+
+
+FAST = Policy()
+DEEP = Policy(workers=40, per_host=10, attempts=5, timeout=25, backoff=1.0,
+              conn_backoff=0.5, trip_after=100, flush_interval=30)
+
+# A board that persistently FAILS — unreachable (DNS/conn/timeout) or HTTP 410 Gone,
+# the unambiguous "this board is dead" signals — this many polls in a row gets
+# retired (still_active=false). Deliberately excludes 429/5xx (transient) and
+# 403/401 (ambiguous IP/UA blocks). ~3 runs/day, so ~3 days; any success resets the
+# count, so a maintenance blip won't reap a live board.
+RETIRE_AFTER = 10
 
 
 def _session() -> requests.Session:
@@ -45,38 +70,37 @@ def _session() -> requests.Session:
     return s
 
 
-def _request(url, session, method="GET", body=None):
-    """Two-try fast-fail retry. Host-level concurrency is the scheduler's job now.
-    - conn/timeout / 429 / 5xx: one quick retry then give up — dead hosts and
-      persistent blocks don't burn long backoff cycles; transient issues clear on
-      the retry.
-    - 404 / other 4xx: raise immediately (caller retires the board)."""
+def _request(url, session, policy, method="GET", body=None):
+    """Retry per policy. Host-level concurrency is the scheduler's job.
+    conn/timeout/429/5xx are retried (with backoff) up to policy.attempts; 404 and
+    other 4xx raise immediately (caller retires the board)."""
     last = None
-    for i in range(2):
+    for i in range(policy.attempts):
+        last_attempt = i == policy.attempts - 1
         try:
             if method == "POST":
                 r = session.post(url, headers={**_UA, "Content-Type": "application/json"},
-                                 json=body or {}, timeout=12)
+                                 json=body or {}, timeout=policy.timeout)
             else:
-                r = session.get(url, headers=_UA, timeout=12)
+                r = session.get(url, headers=_UA, timeout=policy.timeout)
         except (requests.ConnectionError, requests.Timeout) as e:
             last = e
-            if i == 0:
-                time.sleep(0.3)
+            if not last_attempt:
+                time.sleep(policy.conn_backoff * (2 ** i))
             continue
         if r.status_code in (429, 500, 502, 503, 504):
             last = requests.HTTPError(f"{r.status_code}", response=r)
-            if i == 0:
-                time.sleep(0.5)
+            if not last_attempt:
+                time.sleep(policy.backoff * (2 ** i))
             continue
         r.raise_for_status()
         return r
     raise last
 
 
-def fetch_jobs(slug, ats, session):
+def fetch_jobs(slug, ats, session, policy=FAST):
     cfg = ATS[ats]
-    r = _request(cfg["api"].format(slug=slug), session, method=cfg.get("method", "GET"))
+    r = _request(cfg["api"].format(slug=slug), session, policy, method=cfg.get("method", "GET"))
     data = r.json() if r.text else {}
     return ADAPTERS[ats](data, slug)
 
@@ -96,21 +120,26 @@ def _build_rows(jobs, slug, ats):
             "company_slug": slug, "ats_source": ats, "keywords_matched": kws,
             "snippet": (job.get("description") or "")[:500] or None,
             "posted_at": job.get("posted_at"), "last_seen_at": now_iso(),
-            # first_seen_at omitted: default on insert, untouched on conflict.
         }
     return list(rows.values())
 
 
-def _poll(slug, ats):
-    """Worker unit: fetch + filter one company. No DB writes."""
+def _poll(slug, ats, policy):
     try:
-        jobs = fetch_jobs(slug, ats, _session())
+        jobs = fetch_jobs(slug, ats, _session(), policy)
         return {"slug": slug, "ats": ats, "status": "ok",
                 "rows": _build_rows(jobs, slug, ats), "seen": len(jobs)}
     except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else None
-        return {"slug": slug, "ats": ats,
-                "status": "dead404" if code == 404 else "error", "rows": [], "seen": 0}
+        code = e.response.status_code if e.response is not None else 0
+        if code == 404:
+            return {"slug": slug, "ats": ats, "status": "dead404", "rows": [], "seen": 0}
+        if code == 410:  # Gone — board definitively removed -> counts toward retire
+            return {"slug": slug, "ats": ats, "status": "pfail", "rows": [], "seen": 0}
+        # 429/5xx (transient) and 403/401 (ambiguous IP/UA block) -> retry next run
+        return {"slug": slug, "ats": ats, "status": "error", "rows": [], "seen": 0}
+    except (requests.ConnectionError, requests.Timeout):
+        # won't resolve / refuses / hangs -> persistent failure, counts toward retire
+        return {"slug": slug, "ats": ats, "status": "pfail", "rows": [], "seen": 0}
     except Exception:  # noqa: BLE001 — never let one company kill the run
         return {"slug": slug, "ats": ats, "status": "error", "rows": [], "seen": 0}
 
@@ -120,8 +149,49 @@ def _chunked_upsert(table, rows, on_conflict, size=500):
         db.upsert(table, rows[i:i + size], on_conflict=on_conflict)
 
 
-def run_refresh(workers=60, per_host=PER_HOST_CAP, trip_after=TRIP_AFTER):
-    companies = db.select_all("companies", {"select": "company_slug,ats_source,still_active"})
+def _write(batch, fail_map):
+    """Persist a batch: listings + last_polled_at + retirements. A success resets
+    fail_count to 0; an UNREACHABLE poll bumps it, and a board retires once it hits
+    RETIRE_AFTER consecutive. 404 retires immediately; 429/5xx are left untouched."""
+    all_rows, polled_ok, retire, bump = {}, [], [], []
+    for res in batch:
+        pair = (res["slug"], res["ats"])
+        st = res["status"]
+        if st == "ok":
+            polled_ok.append(pair)
+            for row in res["rows"]:
+                all_rows[row["canonical_url"]] = row
+        elif st == "dead404":
+            retire.append(pair)
+        elif st == "pfail":
+            n = fail_map.get(pair, 0) + 1
+            if n >= RETIRE_AFTER:
+                retire.append(pair)
+            else:
+                bump.append((pair, n))
+        # "error" (429/5xx) -> transient/blocked, leave the row untouched
+
+    if all_rows:
+        _chunked_upsert("listings", list(all_rows.values()), "canonical_url")
+    if polled_ok:
+        stamp = now_iso()
+        _chunked_upsert("companies", [{"company_slug": s, "ats_source": a,
+                                       "last_polled_at": stamp, "fail_count": 0}
+                                      for s, a in polled_ok], "company_slug,ats_source")
+    if retire:
+        _chunked_upsert("companies", [{"company_slug": s, "ats_source": a, "still_active": False}
+                                      for s, a in retire], "company_slug,ats_source")
+    if bump:
+        _chunked_upsert("companies", [{"company_slug": s, "ats_source": a, "fail_count": n}
+                                      for (s, a), n in bump], "company_slug,ats_source")
+    return sum(len(r["rows"]) for r in batch if r["status"] == "ok")
+
+
+def run_refresh(policy=FAST, workers=None):
+    workers = workers or policy.workers
+    companies = db.select_all("companies",
+                              {"select": "company_slug,ats_source,still_active,fail_count"})
+    fail_map = {(c["company_slug"], c["ats_source"]): c.get("fail_count") or 0 for c in companies}
 
     capped, free = {}, deque()
     for c in companies:
@@ -140,15 +210,16 @@ def run_refresh(workers=60, per_host=PER_HOST_CAP, trip_after=TRIP_AFTER):
     fails = {h: 0 for h in hosts}
     tripped = set()
     print(f"{len(companies)} companies, {n_capped + len(free)} pollable: "
-          f"{n_capped} on {len(hosts)} shared hosts (cap {per_host}), {len(free)} unique-host. "
-          f"workers={workers}")
+          f"{n_capped} on {len(hosts)} shared hosts (cap {policy.per_host}), {len(free)} unique-host. "
+          f"workers={workers}, attempts={policy.attempts}, trip@{policy.trip_after}, "
+          f"flush={policy.flush_interval or 'end'}")
 
     cond = threading.Condition()
     results = []
     rr = [0]
     skipped_tripped = [0]
 
-    def _next():  # called holding cond; returns (slug, ats, host|None) | "WAIT" | "DONE"
+    def _next():  # holding cond; returns (slug, ats, host|None) | "WAIT" | "DONE"
         n = len(hosts)
         for k in range(n):
             idx = (rr[0] + k) % n
@@ -156,7 +227,7 @@ def run_refresh(workers=60, per_host=PER_HOST_CAP, trip_after=TRIP_AFTER):
             if h in tripped:
                 continue
             dq = capped[h]
-            if dq and inflight[h] < per_host:
+            if dq and inflight[h] < policy.per_host:
                 rr[0] = (idx + 1) % n
                 slug, ats = dq.popleft()
                 inflight[h] += 1
@@ -165,7 +236,7 @@ def run_refresh(workers=60, per_host=PER_HOST_CAP, trip_after=TRIP_AFTER):
             slug, ats = free.popleft()
             return slug, ats, None
         if any(capped[h] and h not in tripped for h in hosts):
-            return "WAIT"   # pending exists but all at cap -> a completion will free a slot
+            return "WAIT"
         return "DONE"
 
     def worker():
@@ -180,56 +251,63 @@ def run_refresh(workers=60, per_host=PER_HOST_CAP, trip_after=TRIP_AFTER):
                         continue
                     break
                 slug, ats, host = t
-            res = _poll(slug, ats)
+            res = _poll(slug, ats, policy)
             with cond:
                 if host is not None:
                     inflight[host] -= 1
-                    if res["status"] == "error":     # 429/conn/5xx — count toward trip
+                    if res["status"] in ("error", "pfail"):
                         fails[host] += 1
-                        if fails[host] >= trip_after and host not in tripped:
+                        if fails[host] >= policy.trip_after and host not in tripped:
                             tripped.add(host)
                             skipped_tripped[0] += len(capped[host])
                             capped[host].clear()
-                    else:                             # ok / dead404 -> host is healthy
+                    else:
                         fails[host] = 0
                 results.append(res)
                 if len(results) % 2000 == 0:
                     print(f"  ...{len(results)} polled, {sum(1 for r in results if r['rows'])} matched")
                 cond.notify_all()
 
+    # optional incremental flusher (DEEP) — single thread owns DB writes, so the
+    # shared db session is never touched concurrently.
+    flushed = [0]
+    stop_flush = threading.Event()
+
+    def _flush():
+        with cond:
+            batch, flushed[0] = results[flushed[0]:], len(results)
+        if batch:
+            _write(batch, fail_map)
+
+    def flusher():
+        while not stop_flush.wait(policy.flush_interval):
+            _flush()
+
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+    fl = threading.Thread(target=flusher, daemon=True) if policy.flush_interval else None
     for t in threads:
         t.start()
+    if fl:
+        fl.start()
     for t in threads:
         t.join()
+    if fl:
+        stop_flush.set()
+        fl.join()
 
-    # ---- aggregate + batched writes (main thread) ----
-    all_rows, polled_ok, dead = {}, [], []
-    seen = 0
-    for res in results:
-        if res["status"] == "ok":
-            polled_ok.append((res["slug"], res["ats"]))
-            seen += res["seen"]
-            for row in res["rows"]:
-                all_rows[row["canonical_url"]] = row
-        elif res["status"] == "dead404":
-            dead.append((res["slug"], res["ats"]))
+    _flush()  # final flush (the whole run, for FAST; the remainder, for DEEP)
 
-    rows = list(all_rows.values())
-    if rows:
-        _chunked_upsert("listings", rows, "canonical_url")
-    if polled_ok:
-        stamp = now_iso()
-        _chunked_upsert("companies", [{"company_slug": s, "ats_source": a, "last_polled_at": stamp}
-                                      for s, a in polled_ok], "company_slug,ats_source")
-    if dead:
-        _chunked_upsert("companies", [{"company_slug": s, "ats_source": a, "still_active": False}
-                                      for s, a in dead], "company_slug,ats_source")
-
+    seen = sum(r["seen"] for r in results if r["status"] == "ok")
+    upserted = len({row["canonical_url"] for r in results if r["status"] == "ok" for row in r["rows"]})
+    pfail = sum(1 for r in results if r["status"] == "pfail")
+    retired = sum(1 for r in results if r["status"] == "dead404") + sum(
+        1 for r in results if r["status"] == "pfail"
+        and fail_map.get((r["slug"], r["ats"]), 0) + 1 >= RETIRE_AFTER)
     errs = sum(1 for r in results if r["status"] == "error")
-    print(f"TOTAL: {seen} jobs seen, {len(rows)} listings upserted, {len(dead)} retired (404), "
-          f"{errs} errors, {len(tripped)} hosts tripped ({skipped_tripped[0]} skipped)")
-    return seen, len(rows)
+    print(f"TOTAL: {seen} jobs seen, {upserted} listings, {retired} retired, "
+          f"{pfail} persistent-fail, {errs} errors, {len(tripped)} hosts tripped "
+          f"({skipped_tripped[0]} skipped)")
+    return seen, upserted
 
 
 if __name__ == "__main__":

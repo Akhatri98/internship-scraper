@@ -1,20 +1,21 @@
-name: freshness
+name: freshness-deep
 
-# Component B — poll every company's ATS public JSON, filter, upsert listings.
+# Component B, DEEP profile — nightly thorough sweep. Patient retries + high trip
+# threshold + incremental flushing, with hours of leeway, to squeeze out the
+# flaky/blocked hosts the 2x/day FAST runs skip.
 on:
   schedule:
-    - cron: "0 9 * * *"   # 09:00 UTC
-    - cron: "0 21 * * *"  # 21:00 UTC (~12h apart so the 2nd run finds new posts)
+    - cron: "0 7 * * *"   # 07:00 UTC nightly (~02:00-03:00 US Eastern)
   workflow_dispatch: {}
 
 concurrency:
-  group: freshness
-  cancel-in-progress: false   # let an in-flight run finish rather than double-work
+  group: freshness-deep
+  cancel-in-progress: false
 
 jobs:
-  refresh:
+  refresh-deep:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 210   # ~3.5h: 3h of leeway + margin
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,11 +23,11 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Run refresh
+      - name: Run deep refresh
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python -m scripts.run_refresh
+        run: python -m scripts.run_refresh --deep
       - name: Audit log (heartbeat)
         if: ${{ always() }}
         env:
