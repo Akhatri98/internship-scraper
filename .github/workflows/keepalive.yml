@@ -1,0 +1,37 @@
+name: keepalive
+
+# GitHub auto-disables scheduled workflows after 60 days with no repo commits.
+# This weekly job makes a trivial commit so freshness/discovery never go dormant.
+on:
+  schedule:
+    - cron: "0 0 * * 0"   # Sundays 00:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch keepalive file
+        run: |
+          date -u +%Y-%m-%dT%H:%M:%SZ > .github/keepalive.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive.txt
+          git commit -m "chore: keepalive" || exit 0
+          git push
+      - name: Audit log (heartbeat)
+        if: ${{ always() }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          curl -s -X POST "$SUPABASE_URL/rest/v1/audit_log" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{\"note\":\"${GITHUB_WORKFLOW} run ${GITHUB_RUN_ID} finished with status ${{ job.status }}\"}" || true

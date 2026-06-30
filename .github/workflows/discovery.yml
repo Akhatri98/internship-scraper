@@ -1,0 +1,56 @@
+name: discovery
+
+# Component A — monthly Common Crawl company discovery (free, diff-append).
+on:
+  schedule:
+    - cron: "0 6 1 * *"   # 06:00 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: "CDX pages per domain (bounds runtime; default 50)"
+        required: false
+        default: "50"
+
+concurrency:
+  group: discovery
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run discover
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # scheduled runs use 50; manual dispatch can override via the input.
+          MAX_PAGES: ${{ github.event.inputs.max_pages || '50' }}
+        run: python -m scripts.run_discover --max-pages "$MAX_PAGES"
+      - name: Audit log (heartbeat)
+        if: ${{ always() }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          curl -s -X POST "$SUPABASE_URL/rest/v1/audit_log" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{\"note\":\"${GITHUB_WORKFLOW} run ${GITHUB_RUN_ID} finished with status ${{ job.status }}\"}" || true
+      - name: Notify on failure
+        if: ${{ failure() }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "no webhook configured"; exit 0; fi
+          curl -s -H "Content-Type: application/json" \
+            -d "{\"content\":\":x: Job-Bot ${GITHUB_WORKFLOW} failed — ${GITHUB_REPOSITORY} run ${GITHUB_RUN_ID}\"}" \
+            "$DISCORD_WEBHOOK_URL" || true
