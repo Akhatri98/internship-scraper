@@ -7,8 +7,28 @@ def test_intern_plus_tech_passes():
     assert "intern" in kw and "software" in kw
 
 
-def test_intern_without_tech_fails():
+def test_marketing_intern_now_passes():
+    # Post-broadening: marketing is a covered field, so this should surface.
     ok, kw = evaluate("Marketing Intern", "Help with social media campaigns")
+    assert ok
+    assert "intern" in kw and "marketing" in kw
+
+
+def test_finance_coop_passes():
+    ok, kw = evaluate("Finance Co-op", "Support FP&A and financial modeling")
+    assert ok
+    assert "co-op" in kw and "finance" in kw
+
+
+def test_mechanical_intern_passes():
+    ok, kw = evaluate("Mechanical Engineering Intern", "CAD design and prototyping")
+    assert ok
+    assert "mechanical" in kw or "engineering" in kw
+
+
+def test_non_professional_intern_still_fails():
+    # No professional-field term in title or description -> still excluded.
+    ok, _ = evaluate("Kitchen Intern", "Prep food and clean the line each shift")
     assert not ok
 
 

@@ -1,26 +1,55 @@
 from .domains import SEED_DOMAINS
 
+# Field slices for seed discovery (only used when re-burning Serper — steady-state
+# company growth is Common Crawl, which ignores these). Broadened past tech to pull
+# in engineering, life-science, health, and finance/business employers too.
 FIELD_TERMS = [
+    # software / data
     "software engineer",
     "data",
     "machine learning",
     "artificial intelligence",
-    "quantitative",
-    "finance",
+    "computer science",
+    "cybersecurity",
+    # engineering (disciplines)
     "mechanical engineering",
     "electrical engineering",
     "aerospace",
+    "chemical engineering",
+    "civil engineering",
+    "biomedical engineering",
+    "materials science",
     "robotics",
     "hardware",
-    "medical device",
+    "automotive",
+    "manufacturing",
+    # physical & life sciences
+    "physics",
+    "chemistry",
+    "biology",
     "biotech",
-    "computer science",
+    "neuroscience",
     "research scientist",
-    "product manager",
-    "sales",
-    "marketing",
+    # health / medicine
+    "medical device",
+    "clinical",
+    "pharmaceutical",
+    # quantitative / finance / business
+    "quantitative",
+    "finance",
+    "accounting",
+    "economics",
+    "investment banking",
+    "actuarial",
+    "consulting",
     "operations",
+    "supply chain",
     "business development",
+    # marketing / comms / product / design
+    "marketing",
+    "communications",
+    "sales",
+    "product manager",
     "product designer",
 ]
 

@@ -3,8 +3,7 @@ name: freshness
 # Component B — poll every company's ATS public JSON, filter, upsert listings.
 on:
   schedule:
-    - cron: "0 9 * * *"   # 09:00 UTC
-    - cron: "0 21 * * *"  # 21:00 UTC (~12h apart so the 2nd run finds new posts)
+    - cron: "0 */4 * * *"  # every 4h (00,04,08,12,16,20 UTC) — 6x/day for low discovery latency
   workflow_dispatch: {}
 
 concurrency:
@@ -39,12 +38,3 @@ jobs:
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
             -d "{\"note\":\"${GITHUB_WORKFLOW} run ${GITHUB_RUN_ID} finished with status ${{ job.status }}\"}" || true
-      - name: Notify on failure
-        if: ${{ failure() }}
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "no webhook configured"; exit 0; fi
-          curl -s -H "Content-Type: application/json" \
-            -d "{\"content\":\":x: Job-Bot ${GITHUB_WORKFLOW} failed — ${GITHUB_REPOSITORY} run ${GITHUB_RUN_ID}\"}" \
-            "$DISCORD_WEBHOOK_URL" || true

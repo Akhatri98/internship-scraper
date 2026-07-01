@@ -1,22 +1,26 @@
-name: freshness-deep
+name: freshness-prune
 
-# Component B, DEEP profile — nightly thorough sweep. Patient retries + high trip
-# threshold + incremental flushing, with hours of leeway, to squeeze out the
-# flaky/blocked hosts the 2x/day FAST runs skip.
+# Component C — delete listings a healthy board no longer serves (filled/closed
+# jobs that silently dropped out of the ATS feed). Chained to run AFTER the nightly
+# DEEP refresh so last_polled_at reflects the most thorough recent sweep. Uses
+# successful polls as ground truth — no per-URL HTTP checks. See jobbot/prune.py.
 on:
-  schedule:
-    - cron: "0 5 * * *"   # 05:00 UTC nightly (~00:00-01:00 US Eastern) — earlier so the
-                          # prune sweep (freshness-prune, chained on completion) still finishes overnight
+  workflow_run:
+    workflows: ["freshness-deep"]
+    types: [completed]
   workflow_dispatch: {}
 
 concurrency:
-  group: freshness-deep
+  group: freshness-prune
   cancel-in-progress: false
 
 jobs:
-  refresh-deep:
+  prune:
     runs-on: ubuntu-latest
-    timeout-minutes: 210   # ~3.5h: 3h of leeway + margin
+    timeout-minutes: 20
+    # Only after a SUCCESSFUL deep run (a failed/cancelled deep leaves last_polled_at
+    # unreliable). Manual dispatch always runs.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,11 +28,11 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Run deep refresh
+      - name: Run prune
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python -m scripts.run_refresh --deep
+        run: python -m scripts.run_prune
       - name: Audit log (heartbeat)
         if: ${{ always() }}
         env:

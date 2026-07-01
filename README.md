@@ -13,10 +13,12 @@ Three phases, all writing into Supabase:
 |-------|------|--------|---------|
 | **Seed** | one-time cold-start fill of the company list | Serper (one-time free grant) | run once, manually |
 | **Discover** (Component A) | grow the company list | Common Crawl URL index (free) | monthly |
-| **Refresh** (Component B) | pull current listings, filter, dedup | each ATS's public JSON API (free) | 2×/day |
+| **Refresh** (Component B) | pull current listings, filter, dedup | each ATS's public JSON API (free) | 6×/day (FAST) + nightly DEEP |
+| **Prune** (Component C) | drop listings a live board no longer serves | successful Refresh polls (no HTTP) | nightly, after DEEP |
 
 - `companies` — every discovered `(company_slug, ats_source)` pair.
-- `listings` — current student-tech roles, deduped by `canonical_url`.
+- `listings` — current student roles across tech, engineering, sciences, health,
+  and finance/business, deduped by `canonical_url`.
 
 ## ATS coverage
 
@@ -44,7 +46,9 @@ The one-time seed lives in `scripts/seed_run.py` and needs `SERPER_API_KEY`.
 
 Workflows in `.github/workflows/`:
 
-- **freshness.yml** — Refresh, 2×/day (09:00 & 21:00 UTC) + manual dispatch.
+- **freshness.yml** — Refresh FAST, 6×/day (every 4h) + manual dispatch.
+- **freshness-deep.yml** — Refresh DEEP, nightly (05:00 UTC) + manual dispatch.
+- **freshness-prune.yml** — Prune, chained after each successful DEEP run + manual dispatch.
 - **discovery.yml** — Discover, monthly (1st, 06:00 UTC) + manual dispatch.
 - **keepalive.yml** — weekly commit so scheduled workflows aren't auto-disabled
   after 60 days of repo inactivity.
@@ -57,7 +61,6 @@ Add repository secrets under **Settings → Secrets and variables → Actions**:
 |--------|----------|---------|
 | `SUPABASE_URL` | ✅ | Supabase project URL |
 | `SUPABASE_SERVICE_KEY` | ✅ | service-role key (writes; bypasses RLS) |
-| `DISCORD_WEBHOOK_URL` | optional | ping on a failed run |
 
 Then trigger each workflow once via **Actions → (workflow) → Run workflow** to
 confirm it's wired before relying on the schedule.

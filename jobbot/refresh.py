@@ -2,12 +2,15 @@
 tech roles, upsert into listings.
 
 Two profiles share one engine (see Policy):
-  * FAST  — runs 2x/day. Speed-first: small retry budget, low circuit-breaker
+  * FAST  — runs 6x/day. Speed-first: small retry budget, low circuit-breaker
             threshold, batch-write at the end. Finishes in minutes.
   * DEEP  — runs nightly with hours of leeway. Completeness-first: patient retries,
             high trip threshold (still gives up on a truly-dead host so it can't
             grind for hours), and incremental flushing so a long run survives a
             crash. Reclaims the per-run completeness/durability that FAST trades away.
+            Also the ONLY profile that condemns a board to retirement (see
+            RETIRE_AFTER): its patient failures are a trustworthy death signal;
+            FAST's impatient ones aren't (though a FAST success still acquits).
 
 Concurrency — a work-conserving, host-aware scheduler (no worker blocks for long):
   * SHARED-host companies (path-based ATSs: greenhouse/lever/ashby/smartrecruiters/
@@ -32,6 +35,7 @@ from . import db
 from .ats.adapters import ADAPTERS
 from .ats.registry import ATS
 from .filters import evaluate
+from .pay import UNPAID, is_unpaid
 from .util import now_iso
 
 _UA = {"User-Agent": "job-bot/0.1 (+https://github.com/Akhatri98/Job-Bot)",
@@ -49,18 +53,24 @@ class Policy:
     conn_backoff: float = 0.3   # base backoff for connection/timeout
     trip_after: int = 8         # consecutive shared-host failures -> trip (skip rest)
     flush_interval: float = 0   # >0 -> flush to DB every N seconds; 0 -> batch at end
+    condemns: bool = False      # may this profile count failures toward retirement? (DEEP only)
 
 
 FAST = Policy()
 DEEP = Policy(workers=40, per_host=10, attempts=5, timeout=25, backoff=1.0,
-              conn_backoff=0.5, trip_after=100, flush_interval=30)
+              conn_backoff=0.5, trip_after=100, flush_interval=30, condemns=True)
 
-# A board that persistently FAILS — unreachable (DNS/conn/timeout) or HTTP 410 Gone,
-# the unambiguous "this board is dead" signals — this many polls in a row gets
-# retired (still_active=false). Deliberately excludes 429/5xx (transient) and
-# 403/401 (ambiguous IP/UA blocks). ~3 runs/day, so ~3 days; any success resets the
-# count, so a maintenance blip won't reap a live board.
-RETIRE_AFTER = 10
+# Retirement (still_active=false) for a board that persistently FAILS —
+# unreachable (DNS/conn/timeout) or HTTP 410 Gone. Rule: ANYONE ACQUITS, ONLY DEEP
+# CONDEMNS. A success on ANY profile (even impatient FAST) resets the count to 0,
+# but only the nightly DEEP sweep BUMPS it — FAST's 2-attempt/12s budget makes its
+# failures unreliable (a slow board / brief deploy trips it while alive), whereas a
+# patient DEEP failure is a trustworthy death signal. So this counts consecutive
+# BAD NIGHTS: at ~1 DEEP run/day it's ~3 days, and it's decoupled from FAST cadence
+# (change freshness.yml freely — no rescale needed). 404 is deterministic and
+# retires immediately on any profile (see _write); only this accruing counter is
+# DEEP-gated.
+RETIRE_AFTER = 3
 
 
 def _session() -> requests.Session:
@@ -112,13 +122,20 @@ def _build_rows(jobs, slug, ats):
         canon, title = job.get("canonical_url"), job.get("title")
         if not canon or not title:
             continue
-        passed, kws = evaluate(title, job.get("description", ""), job.get("employment_type", ""))
+        desc = job.get("description", "")
+        passed, kws = evaluate(title, desc, job.get("employment_type", ""))
         if not passed:
             continue
+        # pay: structured comp from the adapter wins; else flag a clear unpaid signal.
+        pay = job.get("pay") or (UNPAID if is_unpaid(title, desc) else None)
         rows[canon] = {
             "canonical_url": canon, "raw_url": job.get("raw_url"), "title": title,
             "company_slug": slug, "ats_source": ats, "keywords_matched": kws,
-            "snippet": (job.get("description") or "")[:500] or None,
+            "company": job.get("company") or None,
+            "snippet": (desc or "")[:500] or None,
+            "location": (job.get("location") or "")[:200] or None,
+            "country": job.get("country") or None,
+            "pay": (pay or "")[:120] or None,
             "posted_at": job.get("posted_at"), "last_seen_at": now_iso(),
         }
     return list(rows.values())
@@ -149,10 +166,12 @@ def _chunked_upsert(table, rows, on_conflict, size=500):
         db.upsert(table, rows[i:i + size], on_conflict=on_conflict)
 
 
-def _write(batch, fail_map):
-    """Persist a batch: listings + last_polled_at + retirements. A success resets
-    fail_count to 0; an UNREACHABLE poll bumps it, and a board retires once it hits
-    RETIRE_AFTER consecutive. 404 retires immediately; 429/5xx are left untouched."""
+def _write(batch, fail_map, condemns):
+    """Persist a batch: listings + last_polled_at + retirements. A success on ANY
+    profile resets fail_count to 0. An UNREACHABLE poll bumps it toward RETIRE_AFTER
+    ONLY when `condemns` (DEEP) — FAST leaves it untouched, since its impatient
+    failures aren't a reliable death signal. 404 retires immediately regardless of
+    profile (deterministic); 429/5xx are always left untouched (transient/blocked)."""
     all_rows, polled_ok, retire, bump = {}, [], [], []
     for res in batch:
         pair = (res["slug"], res["ats"])
@@ -162,14 +181,14 @@ def _write(batch, fail_map):
             for row in res["rows"]:
                 all_rows[row["canonical_url"]] = row
         elif st == "dead404":
-            retire.append(pair)
-        elif st == "pfail":
+            retire.append(pair)                 # deterministic death — any profile condemns
+        elif st == "pfail" and condemns:        # accruing death — only DEEP counts it
             n = fail_map.get(pair, 0) + 1
             if n >= RETIRE_AFTER:
                 retire.append(pair)
             else:
                 bump.append((pair, n))
-        # "error" (429/5xx) -> transient/blocked, leave the row untouched
+        # "error" (429/5xx blocked), or a FAST "pfail" -> leave the row untouched
 
     if all_rows:
         _chunked_upsert("listings", list(all_rows.values()), "canonical_url")
@@ -277,7 +296,7 @@ def run_refresh(policy=FAST, workers=None):
         with cond:
             batch, flushed[0] = results[flushed[0]:], len(results)
         if batch:
-            _write(batch, fail_map)
+            _write(batch, fail_map, policy.condemns)
 
     def flusher():
         while not stop_flush.wait(policy.flush_interval):
@@ -300,9 +319,10 @@ def run_refresh(policy=FAST, workers=None):
     seen = sum(r["seen"] for r in results if r["status"] == "ok")
     upserted = len({row["canonical_url"] for r in results if r["status"] == "ok" for row in r["rows"]})
     pfail = sum(1 for r in results if r["status"] == "pfail")
-    retired = sum(1 for r in results if r["status"] == "dead404") + sum(
-        1 for r in results if r["status"] == "pfail"
-        and fail_map.get((r["slug"], r["ats"]), 0) + 1 >= RETIRE_AFTER)
+    retired = sum(1 for r in results if r["status"] == "dead404")
+    if policy.condemns:  # only DEEP turns persistent-fails into retirements
+        retired += sum(1 for r in results if r["status"] == "pfail"
+                       and fail_map.get((r["slug"], r["ats"]), 0) + 1 >= RETIRE_AFTER)
     errs = sum(1 for r in results if r["status"] == "error")
     print(f"TOTAL: {seen} jobs seen, {upserted} listings, {retired} retired, "
           f"{pfail} persistent-fail, {errs} errors, {len(tripped)} hosts tripped "

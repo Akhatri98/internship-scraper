@@ -22,3 +22,12 @@ def strip_html(s: str | None) -> str:
     s = html.unescape(s)
     s = _TAG.sub(" ", s)
     return _WS.sub(" ", s).strip()
+
+
+def display_name(slug: str | None) -> str | None:
+    if not slug:
+        return None
+    words = slug.replace("_", " ").replace("-", " ").split()
+    letters = [w for w in words if not w.isdigit()]
+    words = letters or words
+    return " ".join(w.capitalize() for w in words) or None
