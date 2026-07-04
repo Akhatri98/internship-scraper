@@ -302,6 +302,8 @@ def jazzhr_jobs(html_text, slug):
     return out
 
 
+_JV_ROW = re.compile(
+    r'<td class="jv-job-list-name">\s*<a href="(/[^"/]+/job/([^"]+))"\s*>(.*?)</a>\s*</td>\s*'
     r'<td class="jv-job-list-location">\s*(.*?)\s*</td>', re.S)
 
 
@@ -382,6 +384,7 @@ ADAPTERS = {
 
 def workable_fetch(slug, req):
     """POST board API pages via nextPage token (server-fixed 10 results/page)."""
+    api = f"https://apply.workable.com/api/v3/accounts/{slug}/jobs"
     results, token = [], None
     for _ in range(150):  # cap: 1500 jobs
         d = req(api, method="POST", body={"token": token} if token else {}).json() or {}
