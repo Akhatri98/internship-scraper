@@ -12,6 +12,7 @@ slug_in:
 For subdomain ATSs the `domain` is the BASE domain so `site:<domain>` sweeps all
 company subdomains.
 """
+import re
 from urllib.parse import urlsplit
 
 # (domain_for_site_query, ats_source, slug_in)
@@ -49,6 +50,30 @@ def _host(url: str) -> str:
     return netloc.split(":", 1)[0]
 
 
+# Workday URL path may lead with a locale ("en-US", "fr", "en-GB") before the site.
+_WD_LOCALE = re.compile(r"^[a-z]{2}(-[A-Za-z]{2})?$", re.I)
+# Path segments that are never a Workday career-site name.
+_WD_NOT_SITE = {"wday", "job", "jobs", "login", "search"}
+
+
+def _workday_slug(url: str, host: str, domain: str):
+    """Workday needs a COMPOSITE slug "tenant.wdN/Site" — the CXS poll endpoint
+    requires tenant + datacenter host + career-site name, so a bare tenant is
+    useless. Returns None when the URL doesn't reveal the site (e.g. bare host)."""
+    label = host[: -len(domain)].rstrip(".")  # e.g. "blueorigin.wd5"
+    if "." not in label:
+        return None  # no wdN — can't reconstruct the API host
+    tenant = label.split(".")[0]
+    if not tenant or tenant in _GENERIC:
+        return None
+    segs = [s for s in urlsplit(url).path.split("/") if s]
+    if segs and _WD_LOCALE.fullmatch(segs[0]):
+        segs = segs[1:]
+    if not segs or segs[0].lower() in _WD_NOT_SITE:
+        return None
+    return "workday", f"{label.lower()}/{segs[0]}"  # site name keeps its case
+
+
 def extract(url: str):
     """Return (ats_source, slug) or None if no confident slug."""
     host = _host(url)
@@ -64,6 +89,8 @@ def extract(url: str):
         else:  # subdomain
             if host != domain and not host.endswith("." + domain):
                 continue
+            if ats == "workday":
+                return _workday_slug(url, host, domain)
             label = host[: -len(domain)].rstrip(".")  # everything before the base
             if not label:
                 return None  # bare base domain, no company

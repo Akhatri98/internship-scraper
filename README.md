@@ -13,7 +13,7 @@ Three phases, all writing into Supabase:
 |-------|------|--------|---------|
 | **Seed** | one-time cold-start fill of the company list | Serper (one-time free grant) | run once, manually |
 | **Discover** (Component A) | grow the company list | Common Crawl URL index (free) | monthly |
-| **Refresh** (Component B) | pull current listings, filter, dedup | each ATS's public JSON API (free) | 6×/day (FAST) + nightly DEEP |
+| **Refresh** (Component B) | pull current listings, filter, dedup | each ATS's public JSON API (free) | hourly (FAST) + nightly DEEP |
 | **Prune** (Component C) | drop listings a live board no longer serves | successful Refresh polls (no HTTP) | nightly, after DEEP |
 
 - `companies` — every discovered `(company_slug, ats_source)` pair.
@@ -22,11 +22,22 @@ Three phases, all writing into Supabase:
 
 ## ATS coverage
 
-**Pollable** (Refresh has an adapter): greenhouse, lever, ashby, smartrecruiters,
-workable, rippling, breezy, recruitee, teamtailor.
+**Pollable** (Refresh has an adapter/fetcher): greenhouse, lever, ashby,
+smartrecruiters, workable, rippling, breezy, recruitee, teamtailor, bamboohr,
+jazzhr, jobvite, workday.
 
-**Discover-only** (slugs captured, no clean public JSON yet): workday, icims,
-jobvite, jazzhr, zohorecruit, bamboohr.
+- workable / smartrecruiters / workday / jobvite need multi-request fetchers
+  (pagination or per-term server-side search) — see `FETCHERS` in
+  `jobbot/ats/adapters.py`.
+- workday uses a composite slug `tenant.wdN/Site` (the CXS API needs the
+  datacenter host + career-site name, not just the tenant); bare-tenant rows
+  were retired by `scripts/repair_workday.py`.
+- jazzhr / jobvite have no public JSON — their server-rendered boards are
+  parsed by regex (title + location only; the HARD intern-gate is title-only
+  anyway).
+
+**Discover-only** (client-rendered, no public feed — not pollable): icims,
+zohorecruit.
 
 ## Local usage
 
@@ -46,7 +57,7 @@ The one-time seed lives in `scripts/seed_run.py` and needs `SERPER_API_KEY`.
 
 Workflows in `.github/workflows/`:
 
-- **freshness.yml** — Refresh FAST, 6×/day (every 4h) + manual dispatch.
+- **freshness.yml** — Refresh FAST, hourly (skips 05–06 UTC for DEEP clearance) + manual dispatch.
 - **freshness-deep.yml** — Refresh DEEP, nightly (05:00 UTC) + manual dispatch.
 - **freshness-prune.yml** — Prune, chained after each successful DEEP run + manual dispatch.
 - **discovery.yml** — Discover, monthly (1st, 06:00 UTC) + manual dispatch.

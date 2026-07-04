@@ -26,9 +26,11 @@ from datetime import datetime, timedelta
 
 from . import db
 
-# > the longest plausible FAST run (its timeout is 30m; all rows share one
-# end-of-run last_polled_at while last_seen_at spans the run) and < the 4h gap
-# between FAST runs, so a still-live job is never mistaken for gone.
+# > the longest plausible FAST run (its timeout is 30m; a listing's last_seen_at
+# and its company's last_polled_at are stamped by different flushes within the
+# run), so a still-live job is never mistaken for gone. With hourly FAST runs
+# this means a job must be absent from ~2 consecutive successful polls to be
+# judged closed — margin only delays pruning, so bigger is the safe direction.
 STALE_MARGIN = timedelta(hours=2)
 
 # Refuse to delete more than this share of all listings in one run.

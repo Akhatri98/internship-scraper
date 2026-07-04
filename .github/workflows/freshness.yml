@@ -3,7 +3,7 @@ name: freshness
 # Component B — poll every company's ATS public JSON, filter, upsert listings.
 on:
   schedule:
-    - cron: "0 */4 * * *"  # every 4h (00,04,08,12,16,20 UTC) — 6x/day for low discovery latency
+    - cron: "7 0-4,7-23 * * *"
   workflow_dispatch: {}
 
 concurrency:

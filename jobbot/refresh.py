@@ -2,8 +2,8 @@
 tech roles, upsert into listings.
 
 Two profiles share one engine (see Policy):
-  * FAST  — runs 6x/day. Speed-first: small retry budget, low circuit-breaker
-            threshold, batch-write at the end. Finishes in minutes.
+  * FAST  — runs hourly (skipping the DEEP window). Speed-first: small retry
+            budget, low circuit-breaker threshold, minute-interval flushing.
   * DEEP  — runs nightly with hours of leeway. Completeness-first: patient retries,
             high trip threshold (still gives up on a truly-dead host so it can't
             grind for hours), and incremental flushing so a long run survives a
@@ -23,6 +23,7 @@ Concurrency — a work-conserving, host-aware scheduler (no worker blocks for lo
   * Circuit breaker: a shared host with Policy.trip_after consecutive failures is
     tripped and its remaining companies skipped for the run.
 """
+import random
 import threading
 import time
 from collections import deque
@@ -32,7 +33,7 @@ from urllib.parse import urlsplit
 import requests
 
 from . import db
-from .ats.adapters import ADAPTERS
+from .ats.adapters import ADAPTERS, FETCHERS, POLLABLE
 from .ats.registry import ATS
 from .filters import evaluate
 from .pay import UNPAID, is_unpaid
@@ -56,7 +57,10 @@ class Policy:
     condemns: bool = False      # may this profile count failures toward retirement? (DEEP only)
 
 
-FAST = Policy()
+# FAST flushes each minute (not batch-at-end): with paced hosts (see _paced) a
+# run can brush the workflow's 30-min timeout, and a timeout kill must only cost
+# the unpolled tail — which the per-run shuffle rotates — not the whole run.
+FAST = Policy(flush_interval=60)
 DEEP = Policy(workers=40, per_host=10, attempts=5, timeout=25, backoff=1.0,
               conn_backoff=0.5, trip_after=100, flush_interval=30, condemns=True)
 
@@ -80,6 +84,32 @@ def _session() -> requests.Session:
     return s
 
 
+_PACE = {urlsplit(cfg["api"]).netloc: cfg["pace"]
+         for cfg in ATS.values() if cfg.get("pace") and "{" not in urlsplit(cfg["api"]).netloc}
+_pace_lock = threading.Lock()
+_pace_slot: dict[str, float] = {}
+
+
+def _paced(url: str) -> None:
+    pace = _PACE.get(urlsplit(url).netloc)
+    if not pace:
+        return
+    host = urlsplit(url).netloc
+    with _pace_lock:
+        now = time.monotonic()
+        slot = max(_pace_slot.get(host, now), now)
+        _pace_slot[host] = slot + pace
+    if slot > now:
+        time.sleep(slot - now)
+
+
+def _retry_after_secs(r) -> float:
+    try:
+        return float(r.headers.get("Retry-After", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _request(url, session, policy, method="GET", body=None):
     """Retry per policy. Host-level concurrency is the scheduler's job.
     conn/timeout/429/5xx are retried (with backoff) up to policy.attempts; 404 and
@@ -87,6 +117,7 @@ def _request(url, session, policy, method="GET", body=None):
     last = None
     for i in range(policy.attempts):
         last_attempt = i == policy.attempts - 1
+        _paced(url)
         try:
             if method == "POST":
                 r = session.post(url, headers={**_UA, "Content-Type": "application/json"},
@@ -100,6 +131,8 @@ def _request(url, session, policy, method="GET", body=None):
             continue
         if r.status_code in (429, 500, 502, 503, 504):
             last = requests.HTTPError(f"{r.status_code}", response=r)
+            if r.status_code == 429 and _retry_after_secs(r) > 120:
+                raise last
             if not last_attempt:
                 time.sleep(policy.backoff * (2 ** i))
             continue
@@ -109,6 +142,11 @@ def _request(url, session, policy, method="GET", body=None):
 
 
 def fetch_jobs(slug, ats, session, policy=FAST):
+    fetcher = FETCHERS.get(ats)
+    if fetcher:  # multi-request ATS (pagination / multi-query) — owns its URLs
+        def req(url, method="GET", body=None):
+            return _request(url, session, policy, method=method, body=body)
+        return fetcher(slug, req)
     cfg = ATS[ats]
     r = _request(cfg["api"].format(slug=slug), session, policy, method=cfg.get("method", "GET"))
     data = r.json() if r.text else {}
@@ -212,9 +250,10 @@ def run_refresh(policy=FAST, workers=None):
                               {"select": "company_slug,ats_source,still_active,fail_count"})
     fail_map = {(c["company_slug"], c["ats_source"]): c.get("fail_count") or 0 for c in companies}
 
+    random.shuffle(companies)
     capped, free = {}, deque()
     for c in companies:
-        if c.get("still_active") is False or c["ats_source"] not in ADAPTERS:
+        if c.get("still_active") is False or c["ats_source"] not in POLLABLE:
             continue
         slug, ats = c["company_slug"], c["ats_source"]
         if ATS[ats]["slug_in"] == "path":            # shared fixed API host -> cap it
@@ -326,7 +365,7 @@ def run_refresh(policy=FAST, workers=None):
     errs = sum(1 for r in results if r["status"] == "error")
     print(f"TOTAL: {seen} jobs seen, {upserted} listings, {retired} retired, "
           f"{pfail} persistent-fail, {errs} errors, {len(tripped)} hosts tripped "
-          f"({skipped_tripped[0]} skipped)")
+          f"({skipped_tripped[0]} skipped){': ' + ', '.join(sorted(tripped)) if tripped else ''}")
     return seen, upserted
 
 

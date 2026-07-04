@@ -1,3 +1,5 @@
+import re
+from datetime import datetime, timedelta, timezone
 from ..util import ms_to_iso, strip_html, display_name
 from ..geo import country_of
 from ..pay import format_salary
@@ -246,6 +248,124 @@ def teamtailor_jobs(data, slug):
     return out
 
 
+def bamboohr_jobs(data, slug):
+    out = []
+    fallback = display_name(slug)
+    for j in (data or {}).get("result", []):
+        jid = j.get("id")
+        if jid is None:
+            continue
+        lj = j.get("atsLocation") or j.get("location") or {}
+        loc = _join(lj.get("city"), lj.get("state") or lj.get("province"))
+        if not loc and j.get("isRemote"):
+            loc = "Remote"
+        out.append({
+            "canonical_url": f"https://{slug}.bamboohr.com/careers/{jid}",
+            "raw_url": f"https://{slug}.bamboohr.com/careers/{jid}",
+            "title": j.get("jobOpeningName") or "",
+            "description": j.get("departmentLabel") or "",
+            "posted_at": None,  # list endpoint carries no post date
+            "employment_type": j.get("employmentStatusLabel") or "",
+            "location": loc,
+            "country": country_of(lj.get("country"), loc),
+            "company": fallback,
+            "pay": None,
+        })
+    return out
+
+_JAZZ_LINK = re.compile(r'<a\s+href="(https://[^"]+/apply/([A-Za-z0-9]+))[^"]*"\s*>\s*(.*?)\s*</a>', re.S)
+_JAZZ_LOC = re.compile(r'fa-map-marker[\'"]>\s*</i>\s*([^<]+)')
+
+
+def jazzhr_jobs(html_text, slug):
+    out = []
+    fallback = display_name(slug)
+    for chunk in (html_text or "").split("list-group-item-heading")[1:]:
+        m = _JAZZ_LINK.search(chunk)
+        if not m:
+            continue
+        _, jid, title = m.groups()
+        lm = _JAZZ_LOC.search(chunk[:1500])  # location <ul> directly follows the heading
+        loc = strip_html(lm.group(1)) if lm else ""
+        out.append({
+            "canonical_url": f"https://{slug}.applytojob.com/apply/{jid}",
+            "raw_url": m.group(1),
+            "title": strip_html(title),
+            "description": "",
+            "posted_at": None,
+            "employment_type": "",
+            "location": loc,
+            "country": country_of(location=loc or None),
+            "company": fallback,
+            "pay": None,
+        })
+    return out
+
+
+    r'<td class="jv-job-list-location">\s*(.*?)\s*</td>', re.S)
+
+
+def jobvite_jobs(html_pages, slug):
+    out = []
+    fallback = display_name(slug)
+    for page in html_pages if isinstance(html_pages, list) else [html_pages]:
+        for path, jid, title, loc in _JV_ROW.findall(page or ""):
+            loc = strip_html(loc)
+            out.append({
+                "canonical_url": f"https://jobs.jobvite.com/{slug}/job/{jid}",
+                "raw_url": f"https://jobs.jobvite.com{path}",
+                "title": strip_html(title),
+                "description": "",
+                "posted_at": None,
+                "employment_type": "",
+                "location": loc,
+                "country": country_of(location=loc or None),
+                "company": fallback,
+                "pay": None,
+            })
+    return out
+
+
+_WD_POSTED = re.compile(r"posted\s+(today|yesterday|(\d+)\s+days?\s+ago)", re.I)
+
+
+def _workday_posted(text):
+    """'Posted Yesterday' / 'Posted 3 Days Ago' -> ISO date (day resolution).
+    '30+ Days Ago' -> None (unknown, could be far older)."""
+    m = _WD_POSTED.search(text or "")
+    if not m:
+        return None
+    word = m.group(1).lower()
+    days = 0 if word == "today" else 1 if word == "yesterday" else int(m.group(2))
+    return (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+
+
+def workday_jobs(postings, slug):
+    # slug is composite "tenant.wdN/Site"; postings are CXS jobPostings dicts.
+    hostpart, _, site = (slug or "").partition("/")
+    base = f"https://{hostpart}.myworkdayjobs.com"
+    fallback = display_name(hostpart.split(".")[0])
+    out = []
+    for p in postings if isinstance(postings, list) else []:
+        path = p.get("externalPath")
+        if not path:
+            continue
+        loc = p.get("locationsText") or ""
+        out.append({
+            "canonical_url": f"{base}/en-US/{site}{path}",
+            "raw_url": f"{base}/en-US/{site}{path}",
+            "title": p.get("title") or "",
+            "description": "",
+            "posted_at": _workday_posted(p.get("postedOn")),
+            "employment_type": "",
+            "location": loc,
+            "country": country_of(location=loc or None),
+            "company": fallback,
+            "pay": None,
+        })
+    return out
+
+
 ADAPTERS = {
     "greenhouse": greenhouse_jobs,
     "lever": lever_jobs,
@@ -256,4 +376,88 @@ ADAPTERS = {
     "recruitee": recruitee_jobs,
     "rippling": rippling_jobs,
     "teamtailor": teamtailor_jobs,
+    "bamboohr": bamboohr_jobs,
 }
+
+
+def workable_fetch(slug, req):
+    """POST board API pages via nextPage token (server-fixed 10 results/page)."""
+    results, token = [], None
+    for _ in range(150):  # cap: 1500 jobs
+        d = req(api, method="POST", body={"token": token} if token else {}).json() or {}
+        page = d.get("results") or []
+        results.extend(page)
+        token = d.get("nextPage")
+        if not token or not page:
+            break
+    return workable_jobs({"results": results}, slug)
+
+
+def smartrecruiters_fetch(slug, req):
+    """GET posting pages via offset (limit maxes out at 100)."""
+    api = f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"
+    content, offset, total = [], 0, None
+    for _ in range(50):  # cap: 5000 postings
+        d = req(f"{api}?limit=100&offset={offset}").json() or {}
+        page = d.get("content") or []
+        content.extend(page)
+        total = d.get("totalFound") or 0
+        offset += len(page)
+        if not page or offset >= total:
+            break
+    return smartrecruiters_jobs({"content": content}, slug)
+
+
+def jobvite_fetch(slug, req):
+    """GET search pages (?p= is 0-indexed, 50 rows each) until a short page."""
+    pages = []
+    for p in range(40):  # cap: 2000 jobs
+        html = req(f"https://jobs.jobvite.com/{slug}/search?q=&p={p}").text
+        n_before = len(_JV_ROW.findall(html))
+        pages.append(html)
+        if n_before < 50:
+            break
+    return jobvite_jobs(pages, slug)
+
+_WD_SEARCH_TERMS = ("intern", "co-op", "new grad", "early career")
+
+
+def workday_fetch(slug, req):
+    hostpart, _, site = (slug or "").partition("/")
+    if not site:
+        # Bare legacy slug (no career-site name) — CXS is unreachable. Treated
+        # as a poll error upstream; the repair/discovery path supplies composites.
+        raise ValueError(f"workday slug missing site: {slug!r}")
+    tenant = hostpart.split(".")[0]
+    api = f"https://{hostpart}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
+    seen = {}
+    for term in _WD_SEARCH_TERMS:
+        offset, total = 0, None
+        for _ in range(25):  # cap: 500 postings per term
+            d = req(api, method="POST",
+                    body={"limit": 20, "offset": offset, "searchText": term}).json() or {}
+            page = d.get("jobPostings") or []
+            if total is None:
+                total = d.get("total") or 0  # only the first page reports total
+            for p in page:
+                if p.get("externalPath"):
+                    seen.setdefault(p["externalPath"], p)
+            offset += len(page)
+            if not page or offset >= total:
+                break
+    return workday_jobs(list(seen.values()), slug)
+
+
+def jazzhr_fetch(slug, req):
+    """Single server-rendered page listing every opening."""
+    return jazzhr_jobs(req(f"https://{slug}.applytojob.com/apply/").text, slug)
+
+
+FETCHERS = {
+    "workable": workable_fetch,
+    "smartrecruiters": smartrecruiters_fetch,
+    "jobvite": jobvite_fetch,
+    "workday": workday_fetch,
+    "jazzhr": jazzhr_fetch,
+}
+POLLABLE = set(ADAPTERS) | set(FETCHERS)
