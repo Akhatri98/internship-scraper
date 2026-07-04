@@ -104,14 +104,23 @@ def _match(text: str, patterns) -> list[str]:
     return [label for label, pat in patterns if pat.search(text)]
 
 
+def hard_gate(title: str, employment_type: str = "") -> list[str]:
+    """Student-role labels from the HARD gate: TITLE + structured employment type
+    ONLY, never the description (see module note). An empty result means the job
+    can NEVER pass evaluate(), so callers can use it as a cheap necessary-condition
+    pre-check (e.g. skip an expensive per-job description fetch)."""
+    hard = _match(title or "", HARD_PATTERNS)
+    if employment_type and _INTERN_TYPE.search(employment_type) and "intern" not in hard:
+        hard.append("intern")
+    return hard
+
+
 def evaluate(title: str, description: str = "", employment_type: str = "") -> tuple[bool, list[str]]:
     """Return (passes, matched_labels)."""
     title = title or ""
 
     # HARD gate: TITLE only (+ structured employment type). Never the description.
-    hard = _match(title, HARD_PATTERNS)
-    if employment_type and _INTERN_TYPE.search(employment_type) and "intern" not in hard:
-        hard.append("intern")
+    hard = hard_gate(title, employment_type)
     if not hard:
         return False, []
 

@@ -1,9 +1,12 @@
 """Parser tests for the Stage 7 ATSs (bamboohr JSON; jazzhr/jobvite HTML;
-workday CXS postings) plus the workday composite-slug extraction."""
+workday CXS postings) plus the workday composite-slug extraction, the teamtailor
+_jobposting enrichment, and the SmartRecruiters detail-description extraction."""
 from datetime import datetime, timedelta, timezone
 
 from jobbot.ats.adapters import (bamboohr_jobs, jazzhr_jobs, jobvite_jobs,
-                                 workday_jobs, _workday_posted)
+                                 workday_jobs, _workday_posted, teamtailor_jobs,
+                                 _sr_detail_desc)
+from jobbot.filters import hard_gate
 from jobbot.seed.domains import extract
 
 
@@ -93,12 +96,85 @@ def test_workday_jobs_builds_urls_from_composite_slug():
     assert j["posted_at"] == yesterday
 
 
+def test_workday_jobs_uses_detail_when_enriched():
+    postings = [{
+        "title": "Software Engineering Intern", "externalPath": "/job/Seattle/Intern_R1",
+        "locationsText": "Seattle, WA", "postedOn": "Posted 30+ Days Ago",
+        "_detail": {"jobDescription": "<p>Build <b>rockets</b></p>", "location": "Greater Seattle Area",
+                    "country": {"descriptor": "United States of America"}, "startDate": "2026-06-15"},
+    }]
+    (j,) = workday_jobs(postings, "blueorigin.wd5/BlueOrigin")
+    assert j["description"] == "Build rockets"           # real desc, not empty
+    assert j["location"] == "Greater Seattle Area"       # detail location wins
+    assert j["country"] == "United States"               # descriptor normalized
+    assert j["posted_at"] == "2026-06-15"                # exact date beats "30+ Days"
+
+
+def test_workday_jobs_falls_back_without_detail():
+    # no _detail -> list-level behavior (empty desc, relative date, free-text loc)
+    postings = [{"title": "Data Intern", "externalPath": "/job/x_R2",
+                 "locationsText": "Austin, TX", "postedOn": "Posted Today"}]
+    (j,) = workday_jobs(postings, "acme.wd1/Careers")
+    assert j["description"] == ""
+    assert j["location"] == "Austin, TX"
+    assert j["posted_at"] == datetime.now(timezone.utc).date().isoformat()
+
+
 def test_workday_posted_parsing():
     assert _workday_posted("Posted Today") == datetime.now(timezone.utc).date().isoformat()
     assert _workday_posted("Posted 30+ Days Ago") is None  # unknown, not "30"
     assert _workday_posted(None) is None
     three = (datetime.now(timezone.utc) - timedelta(days=3)).date().isoformat()
     assert _workday_posted("Posted 3 Days Ago") == three
+
+
+def test_teamtailor_recovers_location_pay_from_jobposting():
+    data = {"title": "Acme", "items": [{
+        "url": "https://acme.teamtailor.com/jobs/123-data-intern",
+        "title": "Data Intern",
+        "content_html": "<p>Join us</p>",
+        "date_published": "2026-06-01",
+        "location": None,  # top-level location is ~always absent
+        "_jobposting": {
+            "jobLocation": [{"@type": "Place", "address": {
+                "addressLocality": "Paris", "addressRegion": "France", "addressCountry": "FR"}}],
+            "baseSalary": {"currency": "EUR", "value": {
+                "unitText": "MONTH", "minValue": "1500", "maxValue": "1700"}},
+        },
+    }]}
+    (j,) = teamtailor_jobs(data, "acme")
+    assert j["location"] == "Paris, France"
+    assert j["country"] == "France"           # from ISO2 addressCountry
+    assert j["pay"] == "EUR 1500–1700/month"  # unitText lowercased
+    assert j["company"] == "Acme"
+
+
+def test_teamtailor_single_value_pay_and_no_jobposting():
+    data = {"title": "Acme", "items": [
+        {"url": "https://acme.teamtailor.com/jobs/1-a", "title": "A", "content_html": "<p>x</p>",
+         "_jobposting": {"baseSalary": {"currency": "EUR", "value": {"unitText": "DAY", "value": "500"}}}},
+        {"url": "https://acme.teamtailor.com/jobs/2-b", "title": "B"},  # no _jobposting at all
+    ]}
+    a, b = teamtailor_jobs(data, "acme")
+    assert a["pay"] == "EUR 500/day"
+    assert b["pay"] is None and b["location"] == "" and b["title"] == "B"
+
+
+def test_smartrecruiters_detail_desc_extraction():
+    detail = {"jobAd": {"sections": {
+        "jobDescription": {"text": "<p>Build <strong>things</strong></p>"},
+        "qualifications": {"text": "<ul><li>Python</li></ul>"},
+        "additionalInformation": {"text": ""},
+    }}}
+    assert _sr_detail_desc(detail) == "Build things Python"
+    assert _sr_detail_desc({}) == ""  # missing sections -> empty, not a crash
+
+
+def test_hard_gate_is_title_only_necessary_condition():
+    assert hard_gate("Software Engineering Intern") == ["intern"]
+    assert hard_gate("Senior Backend Engineer") == []          # no student term -> no fetch
+    assert hard_gate("Engineer", "Internship") == ["intern"]   # ATS employment type counts
+    assert hard_gate("Internal Audit Manager") == []           # word-boundary: not "intern"
 
 
 def test_extract_workday_composite():

@@ -26,13 +26,18 @@ SEED_DOMAINS = [
     ("jobs.jobvite.com", "jobvite", "path"),
     ("ats.rippling.com", "rippling", "path"),
     ("myworkdayjobs.com", "workday", "subdomain"),
-    ("icims.com", "icims", "subdomain"),
     ("teamtailor.com", "teamtailor", "subdomain"),
     ("bamboohr.com", "bamboohr", "subdomain"),
     ("breezy.hr", "breezy", "subdomain"),
     ("recruitee.com", "recruitee", "subdomain"),
     ("applytojob.com", "jazzhr", "subdomain"),  # JazzHR (name != URL)
-    ("zohorecruit.com", "zohorecruit", "subdomain"),
+    # Disabled: no pollable public feed — both are client-rendered SPAs whose
+    # job data loads via authenticated/obfuscated XHR, so Refresh can never read
+    # them on the free stack (no headless browser; datacenter IPs get blocked).
+    # Discovering their slugs just piles up unpollable rows. Existing rows are
+    # already skipped by Refresh (not in ADAPTERS/FETCHERS); this stops adding more.
+    #   ("icims.com", "icims", "subdomain"),
+    #   ("zohorecruit.com", "zohorecruit", "subdomain"),
 ]
 
 # Subdomain/path labels that are never a company slug.

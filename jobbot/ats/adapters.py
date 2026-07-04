@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from ..util import ms_to_iso, strip_html, display_name
 from ..geo import country_of
 from ..pay import format_salary
+from ..filters import hard_gate
 from .parse import normalize_url
 
 _GH_CANONICAL = "https://job-boards.greenhouse.io/{slug}/jobs/{jid}"
@@ -224,6 +225,28 @@ def rippling_jobs(data, slug):
     return out
 
 
+def _tt_location(jp):
+    """(location, country) from the first jobLocation in teamtailor's embedded
+    schema.org _jobposting. jobLocation is a list of {address: PostalAddress};
+    the top-level item.location is ~always absent, so this is where it lives."""
+    jl = jp.get("jobLocation")
+    if isinstance(jl, dict):
+        jl = [jl]
+    addr = (jl[0].get("address") if jl and isinstance(jl[0], dict) else None) or {}
+    loc = _join(addr.get("addressLocality"), addr.get("addressRegion"))
+    return loc, country_of(addr.get("addressCountry"), loc)
+
+
+def _tt_pay(jp):
+    """teamtailor baseSalary (schema.org MonetaryAmount) -> display string.
+    value is either {value} (single) or {minValue, maxValue}; unitText is the
+    period (YEAR/MONTH/DAY/HOUR)."""
+    bs = jp.get("baseSalary") or {}
+    val = bs.get("value") or {}
+    return format_salary(val.get("minValue") or val.get("value"), val.get("maxValue"),
+                         (val.get("unitText") or "").lower(), bs.get("currency"))
+
+
 def teamtailor_jobs(data, slug):
     out = []
     # teamtailor reports the company name once, at the feed level ("title")
@@ -232,18 +255,22 @@ def teamtailor_jobs(data, slug):
         url = j.get("url")
         if not url:
             continue
+        jp = j.get("_jobposting") or {}   # embedded schema.org JobPosting — richer than top level
         loc = j.get("location") if isinstance(j.get("location"), str) else ""
+        country = country_of(location=loc or None)
+        if not loc:                       # recover loc + ISO2 country from _jobposting
+            loc, country = _tt_location(jp)
         out.append({
             "canonical_url": normalize_url(url),
             "raw_url": url,
             "title": j.get("title") or "",
-            "description": strip_html(j.get("content_html")),
-            "posted_at": j.get("date_published"),
+            "description": strip_html(j.get("content_html")) or strip_html(jp.get("description")),
+            "posted_at": j.get("date_published") or jp.get("datePosted"),
             "employment_type": "",
             "location": loc,
-            "country": country_of(location=loc or None),
+            "country": country,
             "company": company,
-            "pay": None,
+            "pay": _tt_pay(jp),
         })
     return out
 
@@ -342,8 +369,19 @@ def _workday_posted(text):
     return (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
 
 
+def _wd_country(info):
+    """Country descriptor from a CXS detail's jobPostingInfo. `country` is a
+    {descriptor, id} object; geo.country_of normalizes "United States of
+    America" & friends to a display name."""
+    c = info.get("country")
+    return c.get("descriptor") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+
+
 def workday_jobs(postings, slug):
     # slug is composite "tenant.wdN/Site"; postings are CXS jobPostings dicts.
+    # A posting the fetcher enriched carries its CXS detail under "_detail"
+    # (real description + exact country + real posted date); without it we fall
+    # back to the list-level fields (empty desc, free-text loc, relative date).
     hostpart, _, site = (slug or "").partition("/")
     base = f"https://{hostpart}.myworkdayjobs.com"
     fallback = display_name(hostpart.split(".")[0])
@@ -352,16 +390,17 @@ def workday_jobs(postings, slug):
         path = p.get("externalPath")
         if not path:
             continue
-        loc = p.get("locationsText") or ""
+        info = p.get("_detail") or {}
+        loc = info.get("location") or p.get("locationsText") or ""
         out.append({
             "canonical_url": f"{base}/en-US/{site}{path}",
             "raw_url": f"{base}/en-US/{site}{path}",
             "title": p.get("title") or "",
-            "description": "",
-            "posted_at": _workday_posted(p.get("postedOn")),
+            "description": strip_html(info.get("jobDescription")) if info.get("jobDescription") else "",
+            "posted_at": info.get("startDate") or _workday_posted(p.get("postedOn")),
             "employment_type": "",
             "location": loc,
-            "country": country_of(location=loc or None),
+            "country": country_of(_wd_country(info), loc),
             "company": fallback,
             "pay": None,
         })
@@ -396,8 +435,40 @@ def workable_fetch(slug, req):
     return workable_jobs({"results": results}, slug)
 
 
+# canonical_urls (keyed by ATS) that already carry a real, detail-fetched
+# description, so a fetcher can skip re-enriching them. refresh.run_refresh
+# preloads this per run; an ATS absent here (tests / plain CLI) => enrich every
+# match. Used by the detail-enriching fetchers (smartrecruiters, workday).
+_ENRICHED: dict[str, set[str]] = {}
+
+
+def set_enriched(ats: str, urls) -> None:
+    _ENRICHED[ats] = set(urls or ())
+
+
+def _is_enriched(ats: str, canonical_url) -> bool:
+    return canonical_url in _ENRICHED.get(ats, ())
+
+
+def _sr_detail_desc(detail) -> str:
+    """Real job description from a SmartRecruiters posting-detail payload.
+    The LIST endpoint only carries dept/function labels; the DETAIL endpoint has
+    the actual text under jobAd.sections.{jobDescription,qualifications,...}."""
+    secs = ((detail or {}).get("jobAd") or {}).get("sections") or {}
+    parts = [(secs.get(k) or {}).get("text", "")
+             for k in ("jobDescription", "qualifications", "additionalInformation")]
+    return strip_html(" ".join(p for p in parts if p))
+
+
 def smartrecruiters_fetch(slug, req):
-    """GET posting pages via offset (limit maxes out at 100)."""
+    """GET posting pages via offset (limit maxes out at 100), then enrich the
+    student-role postings' descriptions from the per-posting detail endpoint.
+
+    The list endpoint omits descriptions, so a matched listing would otherwise
+    store a bare "Engineering" snippet. We fetch detail ONLY for postings that
+    clear the title-only HARD gate (a necessary condition for evaluate(), so
+    non-student roles are never fetched) and that we haven't already stored a
+    description for — bounding the extra requests to genuinely new matches."""
     api = f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"
     content, offset, total = [], 0, None
     for _ in range(50):  # cap: 5000 postings
@@ -408,7 +479,20 @@ def smartrecruiters_fetch(slug, req):
         offset += len(page)
         if not page or offset >= total:
             break
-    return smartrecruiters_jobs({"content": content}, slug)
+    jobs = smartrecruiters_jobs({"content": content}, slug)
+    for job in jobs:
+        canon = job.get("canonical_url")
+        if _is_enriched("smartrecruiters", canon) or \
+                not hard_gate(job.get("title") or "", job.get("employment_type") or ""):
+            continue
+        jid = (canon or "").rsplit("/", 1)[-1]
+        try:
+            desc = _sr_detail_desc(req(f"{api}/{jid}").json())
+        except Exception:  # noqa: BLE001 — a detail failure just keeps the thin label
+            continue
+        if desc:
+            job["description"] = desc
+    return jobs
 
 
 def jobvite_fetch(slug, req):
@@ -432,12 +516,13 @@ def workday_fetch(slug, req):
         # as a poll error upstream; the repair/discovery path supplies composites.
         raise ValueError(f"workday slug missing site: {slug!r}")
     tenant = hostpart.split(".")[0]
-    api = f"https://{hostpart}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
+    base = f"https://{hostpart}.myworkdayjobs.com"
+    cxs = f"{base}/wday/cxs/{tenant}/{site}"
     seen = {}
     for term in _WD_SEARCH_TERMS:
         offset, total = 0, None
         for _ in range(25):  # cap: 500 postings per term
-            d = req(api, method="POST",
+            d = req(f"{cxs}/jobs", method="POST",
                     body={"limit": 20, "offset": offset, "searchText": term}).json() or {}
             page = d.get("jobPostings") or []
             if total is None:
@@ -448,7 +533,20 @@ def workday_fetch(slug, req):
             offset += len(page)
             if not page or offset >= total:
                 break
-    return workday_jobs(list(seen.values()), slug)
+    # Enrich: the CXS list is title-only, but GET {cxs}{externalPath} returns the
+    # real description PLUS an exact country and a real posted date (startDate) —
+    # fixing workday's two other weak fields, not just the empty snippet. Fetch
+    # only for student-title matches we haven't already stored (see _ENRICHED).
+    postings = list(seen.values())
+    for p in postings:
+        canon = f"{base}/en-US/{site}{p['externalPath']}"
+        if _is_enriched("workday", canon) or not hard_gate(p.get("title") or ""):
+            continue
+        try:
+            p["_detail"] = (req(f"{cxs}{p['externalPath']}").json() or {}).get("jobPostingInfo") or {}
+        except Exception:  # noqa: BLE001 — detail failure keeps the list-level fields
+            continue
+    return workday_jobs(postings, slug)
 
 
 def jazzhr_fetch(slug, req):

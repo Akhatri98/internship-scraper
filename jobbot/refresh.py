@@ -33,7 +33,7 @@ from urllib.parse import urlsplit
 import requests
 
 from . import db
-from .ats.adapters import ADAPTERS, FETCHERS, POLLABLE
+from .ats.adapters import ADAPTERS, FETCHERS, POLLABLE, set_enriched
 from .ats.registry import ATS
 from .filters import evaluate
 from .pay import UNPAID, is_unpaid
@@ -249,6 +249,19 @@ def run_refresh(policy=FAST, workers=None):
     companies = db.select_all("companies",
                               {"select": "company_slug,ats_source,still_active,fail_count"})
     fail_map = {(c["company_slug"], c["ats_source"]): c.get("fail_count") or 0 for c in companies}
+
+    # Preload listings that already have a real (detail-fetched) description so
+    # the detail-enriching fetchers only spend detail requests on new matches.
+    # A stored snippet is truncated to 500 chars; a real description lands near
+    # that, while the list-endpoint fallback (labels / empty) is short — so a
+    # length gate cleanly tells "already enriched" from "still thin".
+    for ats in ("smartrecruiters", "workday"):
+        try:
+            rows = db.select_all("listings", {"select": "canonical_url,snippet",
+                                              "ats_source": f"eq.{ats}"})
+            set_enriched(ats, {r["canonical_url"] for r in rows if len(r.get("snippet") or "") > 200})
+        except Exception:  # noqa: BLE001 — enrichment is best-effort; never block a run
+            set_enriched(ats, set())
 
     random.shuffle(companies)
     capped, free = {}, deque()
