@@ -76,7 +76,12 @@ def _workday_slug(url: str, host: str, domain: str):
         segs = segs[1:]
     if not segs or segs[0].lower() in _WD_NOT_SITE:
         return None
-    return "workday", f"{label.lower()}/{segs[0]}"  # site name keeps its case
+    # Lowercased like every other ATS: the CXS API is case-insensitive on the site
+    # segment, so preserving case bought nothing and minted a SECOND identity for
+    # the same board (e.g. ".../CVS_Health_Careers" vs ".../cvs_health_careers").
+    # Both polled OK, each stamped its own canonical_url, and the resulting twin
+    # listing rows rotted into prune's "gone" bucket. See jobbot/prune.py.
+    return "workday", f"{label.lower()}/{segs[0].lower()}"
 
 
 def extract(url: str):

@@ -7,12 +7,28 @@ runner and keeps every HTTP call visible/debuggable.
 The service-role (secret) key bypasses RLS, so this module must never run
 anywhere client-facing.
 """
+import time
+
 import requests
 
 from . import config
 
 _REST = f"{config.SUPABASE_URL}/rest/v1"
 _session = requests.Session()
+
+# Reads are retried: a run opens with ~33 paged selects (see refresh.run_refresh),
+# and a single transient blip there used to kill the whole workflow before any
+# polling happened. Only conn/timeout/5xx are retried — a 4xx is our bug and must
+# surface immediately.
+_READ_ATTEMPTS = 4
+_READ_TIMEOUT = 60
+
+
+def _retryable(exc) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    resp = getattr(exc, "response", None)
+    return resp is not None and resp.status_code >= 500
 
 
 def _headers(extra: dict | None = None) -> dict:
@@ -27,14 +43,20 @@ def _headers(extra: dict | None = None) -> dict:
 
 
 def select(table: str, params: dict | None = None) -> list[dict]:
-    r = _session.get(
-        f"{_REST}/{table}",
-        headers=_headers(),
-        params=params or {"select": "*"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(_READ_ATTEMPTS):
+        try:
+            r = _session.get(
+                f"{_REST}/{table}",
+                headers=_headers(),
+                params=params or {"select": "*"},
+                timeout=_READ_TIMEOUT,
+            )
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            if attempt == _READ_ATTEMPTS - 1 or not _retryable(e):
+                raise
+            time.sleep(1.5 * (2 ** attempt))
 
 
 def select_all(table: str, params: dict | None = None, page_size: int = 1000) -> list[dict]:

@@ -435,6 +435,19 @@ def workable_fetch(slug, req):
     return workable_jobs({"results": results}, slug)
 
 
+class JobList(list):
+    """A fetch result that knows whether it saw the WHOLE board.
+
+    Prune's ground truth is "a fresh successful poll that didn't re-include the
+    job means the job is closed" — which only holds if the poll was complete. A
+    fetcher that gave up early (page budget, per-term cap) sets complete=False so
+    refresh withholds the prune-authoritative stamp and those listings can never
+    be reaped on the strength of a partial sweep. Plain lists from the simple
+    adapters default to complete (one request == the entire board).
+    """
+    complete = True
+
+
 # canonical_urls (keyed by ATS) that already carry a real, detail-fetched
 # description, so a fetcher can skip re-enriching them. refresh.run_refresh
 # preloads this per run; an ATS absent here (tests / plain CLI) => enrich every
@@ -507,9 +520,35 @@ def jobvite_fetch(slug, req):
     return jobvite_jobs(pages, slug)
 
 _WD_SEARCH_TERMS = ("intern", "co-op", "new grad", "early career")
+_WD_PAGE = 20        # CXS hard-caps `limit` at 20 — larger values 400.
+_WD_FAST_PAGES = 25  # FAST budget per search term (500 postings)
+
+# DEEP sweeps the whole board, so it needs a stop that is generous enough for the
+# biggest real boards (~19k postings == ~950 pages) but still bounded, so one
+# pathological tenant can't grind the nightly run for hours.
+_WD_DEEP_PAGES = 1500
+
+
+def _wd_page(req, cxs, offset, term):
+    """One CXS page -> (postings, total-or-None). Only page 1 reports a
+    trustworthy total; None means the board never told us, which must NOT collapse
+    to 0 — that would read as "empty board, fully swept" and authorize deletion."""
+    d = req(f"{cxs}/jobs", method="POST",
+            body={"limit": _WD_PAGE, "offset": offset, "searchText": term}).json() or {}
+    return (d.get("jobPostings") or []), d.get("total")
 
 
 def workday_fetch(slug, req):
+    """FAST: 4 relevance searches under a page budget (cheap, catches new postings,
+    which sort to the top). DEEP: ONE unfiltered sweep of the entire board.
+
+    The search terms are only a network-side prefilter — filters.evaluate() gates
+    on title first regardless — so a full sweep filtered locally is semantically
+    identical, just complete. It has to be complete: CXS pages deterministically
+    (verified: identical ordering across calls), so anything past a truncation
+    point is permanently invisible, never re-stamped, and would be misread by
+    prune as "this job closed" forever.
+    """
     hostpart, _, site = (slug or "").partition("/")
     if not site:
         # Bare legacy slug (no career-site name) — CXS is unreachable. Treated
@@ -518,21 +557,45 @@ def workday_fetch(slug, req):
     tenant = hostpart.split(".")[0]
     base = f"https://{hostpart}.myworkdayjobs.com"
     cxs = f"{base}/wday/cxs/{tenant}/{site}"
-    seen = {}
-    for term in _WD_SEARCH_TERMS:
+    policy = getattr(req, "policy", None)
+    full_sweep = bool(getattr(policy, "full_sweep", False))
+    # Only an unfiltered sweep may claim completeness. Exhausting all four FAST
+    # search terms still isn't the whole board — a stored listing whose title
+    # matches hard_gate but none of the terms (e.g. "Apprentice Engineer") would
+    # be absent from a "complete" FAST poll and reaped as closed.
+    seen, complete = {}, False
+
+    if full_sweep:
+        # searchText:"" returns the entire board; page until we've drawn `total`.
         offset, total = 0, None
-        for _ in range(25):  # cap: 500 postings per term
-            d = req(f"{cxs}/jobs", method="POST",
-                    body={"limit": 20, "offset": offset, "searchText": term}).json() or {}
-            page = d.get("jobPostings") or []
+        for _ in range(_WD_DEEP_PAGES):
+            page, reported = _wd_page(req, cxs, offset, "")
             if total is None:
-                total = d.get("total") or 0  # only the first page reports total
+                total = reported
             for p in page:
                 if p.get("externalPath"):
                     seen.setdefault(p["externalPath"], p)
             offset += len(page)
-            if not page or offset >= total:
+            # Exhausted either way: an empty page means we read past the end, and
+            # reaching the reported total means we drew every posting.
+            if not page or (total is not None and offset >= total):
+                complete = True
                 break
+        # falling out of the for without break == hit the page ceiling, board
+        # still unexhausted -> `complete` stays False.
+    else:
+        for term in _WD_SEARCH_TERMS:
+            offset, total = 0, None
+            for _ in range(_WD_FAST_PAGES):
+                page, reported = _wd_page(req, cxs, offset, term)
+                if total is None:
+                    total = reported
+                for p in page:
+                    if p.get("externalPath"):
+                        seen.setdefault(p["externalPath"], p)
+                offset += len(page)
+                if not page or (total is not None and offset >= total):
+                    break
     # Enrich: the CXS list is title-only, but GET {cxs}{externalPath} returns the
     # real description PLUS an exact country and a real posted date (startDate) —
     # fixing workday's two other weak fields, not just the empty snippet. Fetch
@@ -546,7 +609,9 @@ def workday_fetch(slug, req):
             p["_detail"] = (req(f"{cxs}{p['externalPath']}").json() or {}).get("jobPostingInfo") or {}
         except Exception:  # noqa: BLE001 — detail failure keeps the list-level fields
             continue
-    return workday_jobs(postings, slug)
+    out = JobList(workday_jobs(postings, slug))
+    out.complete = complete
+    return out
 
 
 def jazzhr_fetch(slug, req):

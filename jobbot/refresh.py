@@ -55,6 +55,7 @@ class Policy:
     trip_after: int = 8         # consecutive shared-host failures -> trip (skip rest)
     flush_interval: float = 0   # >0 -> flush to DB every N seconds; 0 -> batch at end
     condemns: bool = False      # may this profile count failures toward retirement? (DEEP only)
+    full_sweep: bool = False    # may this profile sweep a board exhaustively? (DEEP only)
 
 
 # FAST flushes each minute (not batch-at-end): with paced hosts (see _paced) a
@@ -62,7 +63,8 @@ class Policy:
 # the unpolled tail — which the per-run shuffle rotates — not the whole run.
 FAST = Policy(flush_interval=60)
 DEEP = Policy(workers=40, per_host=10, attempts=5, timeout=25, backoff=1.0,
-              conn_backoff=0.5, trip_after=100, flush_interval=30, condemns=True)
+              conn_backoff=0.5, trip_after=100, flush_interval=30, condemns=True,
+              full_sweep=True)
 
 # Retirement (still_active=false) for a board that persistently FAILS —
 # unreachable (DNS/conn/timeout) or HTTP 410 Gone. Rule: ANYONE ACQUITS, ONLY DEEP
@@ -146,6 +148,7 @@ def fetch_jobs(slug, ats, session, policy=FAST):
     if fetcher:  # multi-request ATS (pagination / multi-query) — owns its URLs
         def req(url, method="GET", body=None):
             return _request(url, session, policy, method=method, body=body)
+        req.policy = policy  # profile-aware fetchers (workday) read full_sweep off this
         return fetcher(slug, req)
     cfg = ATS[ats]
     r = _request(cfg["api"].format(slug=slug), session, policy, method=cfg.get("method", "GET"))
@@ -182,8 +185,10 @@ def _build_rows(jobs, slug, ats):
 def _poll(slug, ats, policy):
     try:
         jobs = fetch_jobs(slug, ats, _session(), policy)
+        # A plain list == a single-request ATS that returned its whole board.
         return {"slug": slug, "ats": ats, "status": "ok",
-                "rows": _build_rows(jobs, slug, ats), "seen": len(jobs)}
+                "rows": _build_rows(jobs, slug, ats), "seen": len(jobs),
+                "complete": getattr(jobs, "complete", True)}
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else 0
         if code == 404:
@@ -210,12 +215,14 @@ def _write(batch, fail_map, condemns):
     ONLY when `condemns` (DEEP) — FAST leaves it untouched, since its impatient
     failures aren't a reliable death signal. 404 retires immediately regardless of
     profile (deterministic); 429/5xx are always left untouched (transient/blocked)."""
-    all_rows, polled_ok, retire, bump = {}, [], [], []
+    all_rows, polled_ok, polled_full, retire, bump = {}, [], [], [], []
     for res in batch:
         pair = (res["slug"], res["ats"])
         st = res["status"]
         if st == "ok":
             polled_ok.append(pair)
+            if res.get("complete", True):
+                polled_full.append(pair)
             for row in res["rows"]:
                 all_rows[row["canonical_url"]] = row
         elif st == "dead404":
@@ -232,9 +239,19 @@ def _write(batch, fail_map, condemns):
         _chunked_upsert("listings", list(all_rows.values()), "canonical_url")
     if polled_ok:
         stamp = now_iso()
+        # Two stamps, deliberately: last_polled_at means "the board answered"
+        # (liveness / retirement), last_full_poll_at means "and we saw ALL of it"
+        # — the only evidence strong enough for prune to delete on. A truncated
+        # poll updates the first and leaves the second untouched, so a partially
+        # swept board simply isn't judged. merge-duplicates only writes the
+        # columns present in the payload, which is what keeps these independent.
         _chunked_upsert("companies", [{"company_slug": s, "ats_source": a,
                                        "last_polled_at": stamp, "fail_count": 0}
                                       for s, a in polled_ok], "company_slug,ats_source")
+        if polled_full:
+            _chunked_upsert("companies", [{"company_slug": s, "ats_source": a,
+                                           "last_full_poll_at": stamp}
+                                          for s, a in polled_full], "company_slug,ats_source")
     if retire:
         _chunked_upsert("companies", [{"company_slug": s, "ats_source": a, "still_active": False}
                                       for s, a in retire], "company_slug,ats_source")
@@ -376,9 +393,14 @@ def run_refresh(policy=FAST, workers=None):
         retired += sum(1 for r in results if r["status"] == "pfail"
                        and fail_map.get((r["slug"], r["ats"]), 0) + 1 >= RETIRE_AFTER)
     errs = sum(1 for r in results if r["status"] == "error")
+    ok_n = sum(1 for r in results if r["status"] == "ok")
+    full = sum(1 for r in results if r["status"] == "ok" and r.get("complete", True))
     print(f"TOTAL: {seen} jobs seen, {upserted} listings, {retired} retired, "
           f"{pfail} persistent-fail, {errs} errors, {len(tripped)} hosts tripped "
           f"({skipped_tripped[0]} skipped){': ' + ', '.join(sorted(tripped)) if tripped else ''}")
+    # Prune can only act on the fully-swept share — worth seeing every run.
+    print(f"COVERAGE: {full}/{ok_n} successful polls were complete sweeps "
+          f"({full / ok_n:.0%} prune-authoritative)" if ok_n else "COVERAGE: no successful polls")
     return seen, upserted
 
 

@@ -179,12 +179,18 @@ def test_hard_gate_is_title_only_necessary_condition():
 
 def test_extract_workday_composite():
     assert extract("https://blueorigin.wd5.myworkdayjobs.com/en-US/BlueOrigin/job/x_R1") == \
-        ("workday", "blueorigin.wd5/BlueOrigin")
+        ("workday", "blueorigin.wd5/blueorigin")
     assert extract("https://tamus.wd1.myworkdayjobs.com/TEEX_External") == \
-        ("workday", "tamus.wd1/TEEX_External")
-    # site case is preserved, host lowered
+        ("workday", "tamus.wd1/teex_external")
+    # Site case is LOWERED now, like every other ATS: CXS is case-insensitive,
+    # so preserving it only minted a SECOND identity for one board — two
+    # companies rows and two canonical_urls per job, the twins rotting in
+    # prune's "gone" bucket. See scripts/dedupe_workday.py.
     assert extract("https://Acme.WD3.myworkdayjobs.com/fr/SiteName") == \
-        ("workday", "acme.wd3/SiteName")
+        ("workday", "acme.wd3/sitename")
+    # the same board discovered under two casings is now ONE slug
+    assert (extract("https://cvshealth.wd1.myworkdayjobs.com/en-US/CVS_Health_Careers/job/x")
+            == extract("https://cvshealth.wd1.myworkdayjobs.com/en-US/cvs_health_careers/job/x"))
     # unusable: bare host, wday internals, missing wdN
     assert extract("https://blueorigin.wd5.myworkdayjobs.com/") is None
     assert extract("https://blueorigin.wd5.myworkdayjobs.com/wday/cxs/blueorigin/X/jobs") is None
