@@ -276,7 +276,11 @@ def run_refresh(policy=FAST, workers=None):
         try:
             rows = db.select_all("listings", {"select": "canonical_url,snippet",
                                               "ats_source": f"eq.{ats}"})
-            set_enriched(ats, {r["canonical_url"] for r in rows if len(r.get("snippet") or "") > 200})
+            # Keep the snippet, not just the URL: the fetcher hands it back to
+            # evaluate() in place of the detail request it is skipping. Dropping
+            # it made every enriched listing fail re-validation forever.
+            set_enriched(ats, {r["canonical_url"]: r["snippet"]
+                               for r in rows if len(r.get("snippet") or "") > 200})
         except Exception:  # noqa: BLE001 — enrichment is best-effort; never block a run
             set_enriched(ats, set())
 

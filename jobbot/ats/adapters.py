@@ -396,7 +396,8 @@ def workday_jobs(postings, slug):
             "canonical_url": f"{base}/en-US/{site}{path}",
             "raw_url": f"{base}/en-US/{site}{path}",
             "title": p.get("title") or "",
-            "description": strip_html(info.get("jobDescription")) if info.get("jobDescription") else "",
+            "description": (strip_html(info["jobDescription"]) if info.get("jobDescription")
+                            else p.get("_cached_desc") or ""),
             "posted_at": info.get("startDate") or _workday_posted(p.get("postedOn")),
             "employment_type": "",
             "location": loc,
@@ -452,15 +453,28 @@ class JobList(list):
 # description, so a fetcher can skip re-enriching them. refresh.run_refresh
 # preloads this per run; an ATS absent here (tests / plain CLI) => enrich every
 # match. Used by the detail-enriching fetchers (smartrecruiters, workday).
-_ENRICHED: dict[str, set[str]] = {}
+# Maps canonical_url -> the description we already stored, so a skipped detail
+# fetch still yields a description. Storing only the URLs (as this used to) made
+# the cache a STALENESS TRAP: the second poll skipped the fetch, evaluate() then
+# saw an empty description, failed its TECH gate, dropped the row, and
+# last_seen_at was never bumped again — so a live job looked closed forever.
+_ENRICHED: dict[str, dict[str, str]] = {}
 
 
 def set_enriched(ats: str, urls) -> None:
-    _ENRICHED[ats] = set(urls or ())
+    """`urls` may be a {url: description} mapping or a bare iterable of urls."""
+    if isinstance(urls, dict):
+        _ENRICHED[ats] = {k: v or "" for k, v in urls.items()}
+    else:
+        _ENRICHED[ats] = {u: "" for u in (urls or ())}
 
 
 def _is_enriched(ats: str, canonical_url) -> bool:
-    return canonical_url in _ENRICHED.get(ats, ())
+    return canonical_url in _ENRICHED.get(ats, {})
+
+
+def _cached_desc(ats: str, canonical_url) -> str:
+    return _ENRICHED.get(ats, {}).get(canonical_url) or ""
 
 
 def _sr_detail_desc(detail) -> str:
@@ -495,8 +509,11 @@ def smartrecruiters_fetch(slug, req):
     jobs = smartrecruiters_jobs({"content": content}, slug)
     for job in jobs:
         canon = job.get("canonical_url")
-        if _is_enriched("smartrecruiters", canon) or \
-                not hard_gate(job.get("title") or "", job.get("employment_type") or ""):
+        if _is_enriched("smartrecruiters", canon):
+            # Same trap as workday: reuse the stored text instead of dropping it.
+            job["description"] = _cached_desc("smartrecruiters", canon) or job.get("description") or ""
+            continue
+        if not hard_gate(job.get("title") or "", job.get("employment_type") or ""):
             continue
         jid = (canon or "").rsplit("/", 1)[-1]
         try:
@@ -603,7 +620,12 @@ def workday_fetch(slug, req):
     postings = list(seen.values())
     for p in postings:
         canon = f"{base}/en-US/{site}{p['externalPath']}"
-        if _is_enriched("workday", canon) or not hard_gate(p.get("title") or ""):
+        if _is_enriched("workday", canon):
+            # Skip the request, but hand the STORED description to the filters —
+            # without it evaluate() drops a job we are actively looking at.
+            p["_cached_desc"] = _cached_desc("workday", canon)
+            continue
+        if not hard_gate(p.get("title") or ""):
             continue
         try:
             p["_detail"] = (req(f"{cxs}{p['externalPath']}").json() or {}).get("jobPostingInfo") or {}

@@ -87,3 +87,39 @@ def test_plain_list_results_count_as_complete(monkeypatch):
                    {}, condemns=False)
     rows = [r for t, rows in upserts if t == "companies" for r in rows]
     assert any("last_full_poll_at" in r for r in rows)
+
+
+# --- the enrichment staleness trap ------------------------------------------
+
+def test_enriched_listing_keeps_its_description_on_a_re_poll():
+    """A stored job whose detail fetch is skipped must still carry a description.
+
+    Without this, evaluate()'s TECH gate saw an empty description, dropped the
+    row, and last_seen_at was never bumped again — so a live job looked closed
+    forever. That inflated workday to 78% "gone" and nearly deleted ~15.5k live
+    listings.
+    """
+    from jobbot.ats.adapters import set_enriched, workday_fetch
+    from jobbot.filters import evaluate
+
+    canon = "https://acme.wd1.myworkdayjobs.com/en-US/site/job/j0"
+    stored = "Pharmacy intern supporting clinical medical operations."
+    set_enriched("workday", {canon: stored})
+    try:
+        req = _board(1, titles="Pharmacy Intern")
+        req.policy = refresh.Policy(full_sweep=True)
+        out = workday_fetch("acme.wd1/site", req)
+        assert out[0]["canonical_url"] == canon
+        assert out[0]["description"] == stored, "cached description was dropped"
+        assert evaluate(out[0]["title"], out[0]["description"])[0] is True
+    finally:
+        set_enriched("workday", {})
+
+
+def test_unenriched_listing_still_gets_a_detail_fetch():
+    from jobbot.ats.adapters import set_enriched, workday_fetch
+    set_enriched("workday", {})
+    req = _board(1, titles="Software Engineering Intern")
+    req.policy = refresh.Policy(full_sweep=True)
+    out = workday_fetch("acme.wd1/site", req)
+    assert len(out) == 1  # detail path exercised, no crash
