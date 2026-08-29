@@ -25,12 +25,50 @@ Run this BEFORE creating the case-insensitive unique index on companies — the
 index cannot be built while duplicates are still present.
 """
 import argparse
+import threading
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit, urlunsplit
 
-from jobbot import db
+import requests
 
-_CHUNK = 100  # ids per `in.(...)` delete, keeps the URL well under limits
+from jobbot import config, db
+
+_CHUNK = 100   # ids per `in.(...)` delete, keeps the URL well under limits
+_WORKERS = 12  # concurrent PATCHes; ~12k single-row rewrites is an hour serially
+
+_local = threading.local()
+
+
+def _session() -> requests.Session:
+    """Per-thread session. jobbot.db owns ONE shared session that the codebase
+    deliberately keeps single-threaded (see refresh._flush), so this parallel
+    rewrite pass must not borrow it."""
+    s = getattr(_local, "s", None)
+    if s is None:
+        s = _local.s = requests.Session()
+    return s
+
+
+def _patch_listing(item):
+    """PATCH one listing by id -> None on success, an error string otherwise."""
+    lid, row = item
+    url = f"{config.SUPABASE_URL}/rest/v1/listings"
+    headers = {"apikey": config.SUPABASE_SERVICE_KEY,
+               "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
+               "Content-Type": "application/json", "Prefer": "return=minimal"}
+    for attempt in range(4):
+        try:
+            r = _session().patch(url, headers=headers, params={"id": f"eq.{lid}"},
+                                 json=row, timeout=60)
+            r.raise_for_status()
+            return None
+        except requests.RequestException as e:
+            resp = getattr(e, "response", None)
+            if (resp is not None and resp.status_code < 500) or attempt == 3:
+                return f"{lid}: {resp.text[:120] if resp is not None else e}"
+            time.sleep(1.5 * (2 ** attempt))
 
 
 def _canon_slug(slug: str) -> str:
@@ -104,16 +142,23 @@ def main():
     groups = defaultdict(list)
     for c in companies:
         groups[(_canon_slug(c["company_slug"]), c["ats_source"])].append(c)
+    # Every group holding a non-canonical row needs work, NOT just multi-row ones.
+    # Most uppercase slugs are singletons with no lowercase twin; renaming their
+    # listings (the listings pass lowercases every company_slug) without renaming
+    # the company row would leave the listing pointing at a row that doesn't
+    # exist — an orphan, which is precisely what prune deletes.
     dupes = {k: v for k, v in groups.items() if len(v) > 1}
-    losers = [c for v in dupes.values() for c in v
+    needs_work = {k: v for k, v in groups.items()
+                  if len(v) > 1 or v[0]["company_slug"] != k[0]}
+    losers = [c for v in needs_work.values() for c in v
               if c["company_slug"] != _canon_slug(c["company_slug"])]
     print(f"companies: {len(companies)} workday rows, {len(dupes)} case-variant groups, "
-          f"{len(losers)} rows to remove")
+          f"{len(needs_work) - len(dupes)} single-row renames, {len(losers)} rows to remove")
     for k, v in list(dupes.items())[:5]:
         print(f"    {k[0][:52]:<52} <- {', '.join(sorted(c['company_slug'] for c in v))}")
 
-    if dupes:
-        merged = [_merge_company(v) for v in dupes.values()]
+    if needs_work:
+        merged = [_merge_company(v) for v in needs_work.values()]
         if apply:
             for i in range(0, len(merged), 500):
                 db.upsert("companies", merged[i:i + 500], on_conflict="company_slug,ats_source")
@@ -157,13 +202,27 @@ def main():
         # a loser currently holds, and canonical_url is unique — the key has to be
         # free before the rewrite can take it.
         _delete_ids("listings", drop_ids, apply)
-        for lid, row in rewrites:
-            db.patch("listings", {"id": f"eq.{lid}"}, row)
+        print(f"  deleted {len(drop_ids)} duplicate listings")
+
+        errors = []
+        with ThreadPoolExecutor(max_workers=_WORKERS) as ex:
+            for n, err in enumerate(ex.map(_patch_listing, rewrites), 1):
+                if err:
+                    errors.append(err)
+                if n % 2000 == 0:
+                    print(f"  ...rewrote {n}/{len(rewrites)}")
+        print(f"  rewrote {len(rewrites) - len(errors)}/{len(rewrites)} listings")
+        if errors:
+            print(f"  {len(errors)} FAILED — company rows left intact so nothing "
+                  f"is orphaned; fix and rerun:")
+            for e in errors[:10]:
+                print(f"    {e}")
+            raise SystemExit(1)
         # Company rows last — a listing must never be an orphan mid-migration.
-        for i in range(0, len(losers), _CHUNK):
-            for c in losers[i:i + _CHUNK]:
-                db.delete("companies", {"company_slug": f"eq.{c['company_slug']}",
-                                        "ats_source": f"eq.{c['ats_source']}"})
+        quoted = [f'"{c["company_slug"]}"' for c in losers]
+        for i in range(0, len(quoted), _CHUNK):
+            db.delete("companies", {"company_slug": f"in.({','.join(quoted[i:i + _CHUNK])})",
+                                    "ats_source": "eq.workday"})
         print(f"\ndeleted {len(drop_ids)} listings, rewrote {len(rewrites)}, "
               f"removed {len(losers)} company rows")
     else:
