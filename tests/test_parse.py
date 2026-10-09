@@ -6,6 +6,7 @@ def test_ats_detection():
     assert ats_from_url("https://job-boards.greenhouse.io/stripe/jobs/123") == "greenhouse"
     assert ats_from_url("https://jobs.lever.co/figma") == "lever"
     assert ats_from_url("https://jobs.ashbyhq.com/openai") == "ashby"
+    assert ats_from_url("https://jobs.gem.com/fetch/am9icG9zdDq") == "gem"
     assert ats_from_url("https://www.linkedin.com/jobs/view/123") is None
     assert ats_from_url("https://example.com") is None
 

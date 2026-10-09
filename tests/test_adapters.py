@@ -1,12 +1,13 @@
 """Parser tests for the Stage 7 ATSs (bamboohr JSON; jazzhr/jobvite HTML;
 workday CXS postings) plus the workday composite-slug extraction, the teamtailor
-_jobposting enrichment, and the SmartRecruiters detail-description extraction."""
+_jobposting enrichment, the SmartRecruiters detail-description extraction, and
+the gem job-board feed + its case-sensitive slug extraction."""
 from datetime import datetime, timedelta, timezone
 
 from jobbot.ats.adapters import (bamboohr_jobs, jazzhr_jobs, jobvite_jobs,
                                  workday_jobs, _workday_posted, teamtailor_jobs,
-                                 _sr_detail_desc)
-from jobbot.filters import hard_gate
+                                 _sr_detail_desc, gem_jobs)
+from jobbot.filters import evaluate, hard_gate
 from jobbot.seed.domains import extract
 
 
@@ -195,3 +196,71 @@ def test_extract_workday_composite():
     assert extract("https://blueorigin.wd5.myworkdayjobs.com/") is None
     assert extract("https://blueorigin.wd5.myworkdayjobs.com/wday/cxs/blueorigin/X/jobs") is None
     assert extract("https://blueorigin.myworkdayjobs.com/en-US/Site") is None
+
+
+# Trimmed from a live api.gem.com/job_board/v0/soeffects/job_posts/ entry.
+_GEM_POST = {
+    "id": "am9icG9zdDqLIuZagE8SU-HqhGf7TGYo",
+    "absolute_url": "https://jobs.gem.com/soeffects/am9icG9zdDqLIuZagE8SU-HqhGf7TGYo",
+    "title": "Electrical Engineering Intern (Summer 2027)",
+    "content": "<p>Design <strong>PCBs</strong> &amp; test boards.</p>",
+    "content_plain": "Design PCBs & test boards.",
+    "first_published_at": "2026-07-19T02:39:49.294Z",
+    "created_at": "2026-07-18T22:00:00.000Z",
+    "employment_type": "intern",
+    "location_type": "in_office",
+    "location": {"name": "El Segundo, United States"},
+    "offices": [{"name": "El Segundo, CA", "location": {"name": "El Segundo, United States"}},
+                {"name": "Redmond, WA", "location": {"name": "Redmond, United States"}}],
+    "departments": [{"id": "x", "name": "Engineering"}],
+}
+
+
+def test_gem_parses_post():
+    (j,) = gem_jobs([_GEM_POST], "soeffects")
+    assert j["canonical_url"] == "https://jobs.gem.com/soeffects/am9icG9zdDqLIuZagE8SU-HqhGf7TGYo"
+    assert j["raw_url"] == _GEM_POST["absolute_url"]
+    assert j["description"] == "Design PCBs & test boards."  # tags stripped, entities unescaped
+    assert j["posted_at"] == "2026-07-19T02:39:49.294Z"
+    assert j["location"] == "El Segundo, United States"     # primary office only
+    assert j["country"] == "United States"
+    assert j["company"] == "Soeffects"
+    assert j["pay"] is None
+    assert evaluate(j["title"], j["description"], j["employment_type"])[0]
+
+
+def test_gem_intern_type_passes_hard_gate_without_title_term():
+    # gem tags employment_type "intern" natively; that alone satisfies HARD
+    post = {**_GEM_POST, "title": "Hardware Engineering, Summer 2027"}
+    (j,) = gem_jobs([post], "soeffects")
+    assert hard_gate(j["title"], j["employment_type"]) == ["intern"]
+    (ft,) = gem_jobs([{**post, "employment_type": "full_time"}], "soeffects")
+    assert hard_gate(ft["title"], ft["employment_type"]) == []
+
+
+def test_gem_country_formats():
+    def country(name):
+        (j,) = gem_jobs([{"id": "1", "title": "X", "location": {"name": name}}], "acme")
+        return j["country"]
+    assert country("United States - Remote") == "United States"
+    assert country("Sofia, Bulgaria") == "Bulgaria"
+    assert country("Honduras - Remote") == "Honduras"  # long tail: not in geo's tables
+    assert country("Remote") is None
+
+
+def test_gem_numeric_id_empty_board_and_junk():
+    # boards migrated from greenhouse keep numeric post ids
+    (j,) = gem_jobs([{"id": "4965519002", "title": "Software Engineer"}], "gem")
+    assert j["canonical_url"] == "https://jobs.gem.com/gem/4965519002"
+    assert j["location"] == "" and j["country"] is None and j["description"] == ""
+    assert gem_jobs([], "gem") == []                     # live but empty board
+    assert gem_jobs([{"title": "no id"}], "gem") == []
+    assert gem_jobs({"code": 404}, "gem") == []          # error body, not a list
+
+
+def test_extract_gem_keeps_slug_case():
+    assert extract("https://jobs.gem.com/deep-infra/am9icG9zdDq") == ("gem", "deep-infra")
+    # vanity paths are case-sensitive (wrong case 404s), so never lowercase them
+    assert extract("https://jobs.gem.com/AcmeCo") == ("gem", "AcmeCo")
+    assert extract("https://jobs.gem.com/") is None
+    assert extract("https://jobs.gem.com/Static/x.js") is None  # generic filter still applies

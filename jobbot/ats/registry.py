@@ -14,6 +14,11 @@ ATS: dict[str, dict] = {
         "slug_in": "path",
         "api": "https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true",
     },
+    "gem": {
+        "hosts": ("jobs.gem.com",),
+        "slug_in": "path",
+        "api": "https://api.gem.com/job_board/v0/{slug}/job_posts/",
+    },
     "smartrecruiters": {
         "hosts": ("jobs.smartrecruiters.com",),
         "slug_in": "path",

@@ -25,6 +25,7 @@ SEED_DOMAINS = [
     ("apply.workable.com", "workable", "path"),
     ("jobs.jobvite.com", "jobvite", "path"),
     ("ats.rippling.com", "rippling", "path"),
+    ("jobs.gem.com", "gem", "path"),
     ("myworkdayjobs.com", "workday", "subdomain"),
     ("teamtailor.com", "teamtailor", "subdomain"),
     ("bamboohr.com", "bamboohr", "subdomain"),
@@ -95,7 +96,13 @@ def extract(url: str):
             if not segs:
                 return None
             slug = segs[0].lower()
-            return (ats, slug) if slug not in _GENERIC else None
+            if slug in _GENERIC:
+                return None
+            # Gem vanity paths are case-SENSITIVE: jobs.gem.com/Fetch and the API
+            # both 404 while /fetch works. So a live URL already carries the one
+            # true casing (no twin risk, unlike workday), and lowercasing it could
+            # only turn a real board into a 404 — which retires it on first poll.
+            return (ats, segs[0]) if ats == "gem" else (ats, slug)
         else:  # subdomain
             if host != domain and not host.endswith("." + domain):
                 continue

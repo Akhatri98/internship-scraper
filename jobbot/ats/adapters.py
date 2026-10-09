@@ -91,6 +91,38 @@ def ashby_jobs(data, slug):
     return out
 
 
+def _gem_country(loc):
+    """Gem builds location.name as "City, Country" / "Country - Remote" / "Remote",
+    always with the full country name, so the last segment is a structured
+    country — which keeps long-tail ones geo's tables don't list ("Honduras")."""
+    return loc.removesuffix(" - Remote").rsplit(",", 1)[-1].strip() or None
+
+
+def gem_jobs(data, slug):
+    out = []
+    fallback = display_name(slug)
+    for j in data if isinstance(data, list) else []:
+        jid = j.get("id")  # numeric (imported from greenhouse) or base64 "jobpost:..."
+        if not jid:
+            continue
+        # top-level location is the primary office; offices[] is customer-entered
+        # and unreliable (seen: a "Canada - Remote" office located in the US)
+        loc = (j.get("location") or {}).get("name") or ""
+        out.append({
+            "canonical_url": f"https://jobs.gem.com/{slug}/{jid}",
+            "raw_url": j.get("absolute_url"),
+            "title": j.get("title") or "",
+            "description": strip_html(j.get("content")) or j.get("content_plain") or "",
+            "posted_at": j.get("first_published_at") or j.get("created_at"),
+            "employment_type": j.get("employment_type") or "",  # full_time | intern | contract | ...
+            "location": loc,
+            "country": country_of(_gem_country(loc), loc),
+            "company": fallback,  # gem feed carries no org name
+            "pay": None,          # comp only appears in description prose
+        })
+    return out
+
+
 def _label(d):
     return (d or {}).get("label") or (d or {}).get("name") or "" if isinstance(d, dict) else ""
 
@@ -412,6 +444,7 @@ ADAPTERS = {
     "greenhouse": greenhouse_jobs,
     "lever": lever_jobs,
     "ashby": ashby_jobs,
+    "gem": gem_jobs,
     "smartrecruiters": smartrecruiters_jobs,
     "workable": workable_jobs,
     "breezy": breezy_jobs,

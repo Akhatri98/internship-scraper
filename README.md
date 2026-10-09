@@ -22,9 +22,12 @@ Three phases, all writing into Supabase:
 
 ## ATS coverage
 
-**Pollable** (Refresh has an adapter/fetcher): greenhouse, lever, ashby,
+**Pollable** (Refresh has an adapter/fetcher): greenhouse, lever, ashby, gem,
 smartrecruiters, workable, rippling, breezy, recruitee, teamtailor, bamboohr,
 jazzhr, jobvite, workday.
+
+- gem's slug is its case-sensitive vanity path (`jobs.gem.com/<slug>`), so
+  discovery keeps its casing instead of lowercasing it like every other ATS.
 
 - workable / smartrecruiters / workday / jobvite need multi-request fetchers
   (pagination or per-term server-side search) — see `FETCHERS` in

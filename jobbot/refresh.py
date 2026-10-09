@@ -13,7 +13,7 @@ Two profiles share one engine (see Policy):
             FAST's impatient ones aren't (though a FAST success still acquits).
 
 Concurrency — a work-conserving, host-aware scheduler (no worker blocks for long):
-  * SHARED-host companies (path-based ATSs: greenhouse/lever/ashby/smartrecruiters/
+  * SHARED-host companies (path-based ATSs: greenhouse/lever/ashby/gem/smartrecruiters/
     workable/rippling — every company of one ATS hits ONE API host) are capped at
     Policy.per_host in flight per host and dispatched round-robin (calibration: these
     hosts tolerate >=24 concurrent with 0% 429).
