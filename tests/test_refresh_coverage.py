@@ -41,7 +41,7 @@ def test_deep_sweeps_a_big_board_completely():
 
 
 def test_fast_never_claims_completeness():
-    """Even a tiny board: FAST's four search terms are not the whole board, so it
+    """Even a tiny board: FAST's search terms are not the whole board, so it
     must not authorize deletion (a hard_gate title matching no term would vanish)."""
     out = workday_fetch("acme.wd1/site", _with_policy(_board(5), full_sweep=False))
     assert out.complete is False

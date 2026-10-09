@@ -569,7 +569,11 @@ def jobvite_fetch(slug, req):
             break
     return jobvite_jobs(pages, slug)
 
-_WD_SEARCH_TERMS = ("intern", "co-op", "new grad", "early career")
+# Multi-word terms are cheap: "entry level" / "graduate" / "junior" hit ~15-75
+# postings on big tenants. No "co-op": CXS matched it against >=90% of the board
+# on 47/54 tenants (quoting it didn't help), so it only burned the page budget on
+# an unranked slice. Co-ops still pass the filters; DEEP's full sweep finds them.
+_WD_SEARCH_TERMS = ("intern", "new grad", "early career", "entry level", "graduate", "junior")
 _WD_PAGE = 20        # CXS hard-caps `limit` at 20 — larger values 400.
 _WD_FAST_PAGES = 25  # FAST budget per search term (500 postings)
 
@@ -589,7 +593,7 @@ def _wd_page(req, cxs, offset, term):
 
 
 def workday_fetch(slug, req):
-    """FAST: 4 relevance searches under a page budget (cheap, catches new postings,
+    """FAST: a few relevance searches under a page budget (cheap, catches new postings,
     which sort to the top). DEEP: ONE unfiltered sweep of the entire board.
 
     The search terms are only a network-side prefilter — filters.evaluate() gates
@@ -609,8 +613,8 @@ def workday_fetch(slug, req):
     cxs = f"{base}/wday/cxs/{tenant}/{site}"
     policy = getattr(req, "policy", None)
     full_sweep = bool(getattr(policy, "full_sweep", False))
-    # Only an unfiltered sweep may claim completeness. Exhausting all four FAST
-    # search terms still isn't the whole board — a stored listing whose title
+    # Only an unfiltered sweep may claim completeness. Exhausting every FAST
+    # search term still isn't the whole board — a stored listing whose title
     # matches hard_gate but none of the terms (e.g. "Apprentice Engineer") would
     # be absent from a "complete" FAST poll and reaped as closed.
     seen, complete = {}, False

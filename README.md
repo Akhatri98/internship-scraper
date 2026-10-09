@@ -1,7 +1,7 @@
 # Job-Bot
 
 Free, cloud-hosted discovery of fresh **student** roles (intern / co-op / new-grad /
-early-career, tech-focused) pulled **ATS-direct** from company job boards — including
+early-career / entry-level, tech-focused) pulled **ATS-direct** from company job boards — including
 obscure companies the big aggregators miss. $0 stack: GitHub Actions + Supabase, no
 paid APIs in the steady state.
 

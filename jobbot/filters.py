@@ -3,7 +3,9 @@
 A job passes only if BOTH gates hit:
   HARD   : a student-role term (intern / co-op / new-grad / early-career) in the
            TITLE, OR a structured employment-type signal from the ATS
-           (Lever commitment, Ashby employmentType).
+           (Lever commitment, Ashby employmentType), OR an entry-level marker
+           (entry level / junior / "Engineer I") in a TITLE that also names a
+           professional field — see LEVEL_PATTERNS for why that one is stricter.
   OR-BAG : at least one PROFESSIONAL-FIELD term anywhere in title OR description.
            No longer tech-only — covers engineering (all disciplines), the
            physical & life sciences, health/medicine, and quantitative / finance /
@@ -27,18 +29,73 @@ import re
 
 # (label, compiled pattern)
 HARD_PATTERNS = [
-    ("intern", re.compile(r"\bintern(ship)?s?\b", re.I)),
+    # "Summer Analyst/Associate" is the banking/law/VC name for an internship.
+    ("intern", re.compile(r"\bintern(ship)?s?\b|\bsummer\s+(analyst|associate)s?\b", re.I)),
     ("co-op", re.compile(r"\bco[\s-]?ops?\b", re.I)),
-    ("new grad", re.compile(r"\bnew[\s-]?grad(uate)?s?\b", re.I)),
-    ("early career", re.compile(r"\bearly[\s-]?career\b", re.I)),
 ]
+
+# New-grad / early-career program terms. Explicit enough to trust like intern,
+# but they also turn up in the titles of the staff who RUN those programs, so
+# they're dropped when _PROGRAM_STAFF hits (see hard_gate).
+GRAD_PATTERNS = [
+    # Any grad/graduate: "New Grad", "College Grad 2027", "2027 Graduates", and UK
+    # schemes ("Graduate Civil Engineer", "Engineering Graduate"). Not graduate
+    # SCHOOL roles ("Graduate Admissions", "Graduate Research Assistant"), and not
+    # "Recent Grads welcome" — that's a hint low-skill postings use, so it's a
+    # LEVEL pattern below. Nor trucking's "Recent CDL Grads" (driving school).
+    ("new grad", re.compile(
+        r"(?<!post-)(?<!post )(?<!recent )(?<!cdl )\bgrad(uate)?s?\b"
+        r"(?!\s+(admissions?|school|studies|students?|medical\s+education|assistant|research|teaching|programs|degree|course))"
+        r"|\bclass\s+of\s+20\d\d\b|\b(university|college|campus)\s+hires?\b|\bfreshers?\b", re.I)),
+    ("early career", re.compile(
+        r"\bearly[\s-]+(in[\s-]+)?careers?\b|\b(early|emerging)\s+talent\b"
+        r"|\b(rotation(al)?|trainee)\s+program(me)?s?\b"
+        r"|\b(leadership|graduate|professional|engineering|technical|technology|finance|financial|career)"
+        r"\s+development\s+program(me)?s?\b", re.I)),
+]
+
+# "Early Careers Recruiter", "Graduate Program Coordinator", "Head of Early Talent",
+# and university staff ("Graduate Evaluator - Enrollment Operations").
+_PROGRAM_STAFF = re.compile(
+    r"\b(recruit(er|ers|ing|ment)|talent\s+acquisition|sourcer|admissions?|enrol(l)?ment|registrar)\b"
+    r"|\bprogram(me)?s?\s+(manager|director|lead|coordinator|administrator|specialist|advisor|partner)\b"
+    r"|\b(head|director|manager|lead)\s+of\b", re.I)
+
+# Bare seniority markers. Unlike the program terms above, these are stamped on
+# every job family — "Teller I", "Entry Level Warehouse Associate", "Junior
+# Cashier" — and a hospital or retailer board would flood through the
+# description-scanning OR-bag (nearly every description says "development" or
+# "health care"). So they only count when the TITLE itself names a professional
+# field, and never alongside a senior marker ("Account Director I"). "Manager"
+# isn't one — "Junior Project Manager" and "Associate Product Manager" are junior.
+_LEVEL_ONE_ROLE = (r"\b(engineer|developer|programmer|scientist|analyst|accountant|auditor|consultant"
+                   r"|designer|technologist|chemist|biologist|statistician|biostatistician|researcher"
+                   r"|associate|sde|swe)s?")
+LEVEL_PATTERNS = [
+    ("entry level", re.compile(
+        r"\bentry[\s-]*level\b|\b(junior|jr)\b|\btrainees?\b"
+        r"|\b0\s*(-|–|to)\s*[1-3]\s*\+?\s*(years?|yrs?|yoe)\b"
+        # "Engineer I", "Analyst - Level 1", "Scientist I/II" — but not II/IV/10,
+        # and not the I in "I&C" / "UK&I". Uppercase only: a lone "i" isn't a level.
+        + r"|" + _LEVEL_ONE_ROLE + r"\s*([-–,]\s*)?(level\s*)?(?-i:I|1)(?![\w&+])"
+        # "Associate Software Engineer", "Associate Scientist", "Associate Product
+        # Manager" — the role noun is what separates these from "Associate Director".
+        # Not when a higher level follows ("Associate Services Engineer II").
+        + r"|\bassociate\s+([a-z/&]+\s+){0,3}?(engineer|developer|programmer|scientist"
+          r"|product\s+manager|product\s+designer|consultant)s?\b"
+          r"(?!\s*([-–,]\s*)?(level\s*)?((?-i:II|III|IV)|[2-5])\b)", re.I)),
+    ("new grad", re.compile(r"\brecent[\s-]+grad(uate)?s?\b", re.I)),
+]
+
+_SENIOR = re.compile(
+    r"\b(senior|sr|snr|staff|principal|lead|director|head|chief|vp|vice\s+president|supervisor|experienced)\b", re.I)
 
 # (label, pattern) — labels feed listings.keywords_matched, so keep them
 # display-friendly. Grouped by field family for readability.
 ORBAG_PATTERNS = [
     # --- software / CS / data ---
     ("software", re.compile(r"\bsoftware\b", re.I)),
-    ("developer", re.compile(r"\bdevelop(er|ment)?\b", re.I)),
+    ("developer", re.compile(r"\b(develop(er|ment)?|programmer)\b", re.I)),
     ("AI", re.compile(r"\b(ai|artificial intelligence)\b", re.I)),
     ("ML", re.compile(r"\b(ml|machine learning)\b", re.I)),
     ("data", re.compile(r"\bdata\b", re.I)),
@@ -67,7 +124,9 @@ ORBAG_PATTERNS = [
     ("biology", re.compile(r"\b(biology|biologist|molecular|genomics?|genetics)\b", re.I)),
     ("biotech", re.compile(r"\b(biotech(nology)?|bioinformatics|life sciences?)\b", re.I)),
     ("neuroscience", re.compile(r"\bneuroscience\b", re.I)),
-    ("research", re.compile(r"\bresearch\b", re.I)),
+    ("research", re.compile(r"\bresearch(ers?)?\b", re.I)),
+    # the title alone ("Associate Scientist I") has to carry LEVEL_PATTERNS jobs
+    ("scientist", re.compile(r"\bscientists?\b", re.I)),
     ("laboratory", re.compile(r"\blab(oratory)?\b", re.I)),
     # --- health / medicine ---
     ("medical", re.compile(r"\b(medical|medicine|clinical|health\s?care|pharmaceutical|pharma)\b", re.I)),
@@ -81,7 +140,7 @@ ORBAG_PATTERNS = [
     ("consulting", re.compile(r"\bconsult(ing|ant)\b", re.I)),
     ("business", re.compile(r"\b(business|operations|strategy)\b", re.I)),
     ("supply chain", re.compile(r"\b(supply chain|logistics|procurement)\b", re.I)),
-    ("analytics", re.compile(r"\b(analytics|analyst|statistics|statistical)\b", re.I)),
+    ("analytics", re.compile(r"\b(analytics|analyst|statistics|statistical|(bio)?statisticians?)\b", re.I)),
     ("mathematics", re.compile(r"\bmathematic(s|al)\b", re.I)),
     # --- marketing / communications / product / design ---
     ("marketing", re.compile(r"\bmarketing\b", re.I)),
@@ -109,10 +168,17 @@ def hard_gate(title: str, employment_type: str = "") -> list[str]:
     ONLY, never the description (see module note). An empty result means the job
     can NEVER pass evaluate(), so callers can use it as a cheap necessary-condition
     pre-check (e.g. skip an expensive per-job description fetch)."""
-    hard = _match(title or "", HARD_PATTERNS)
-    if employment_type and _INTERN_TYPE.search(employment_type) and "intern" not in hard:
+    title = title or ""
+    hard = _match(title, HARD_PATTERNS)
+    if not _PROGRAM_STAFF.search(title):
+        hard += _match(title, GRAD_PATTERNS)
+        # LEVEL needs its field in the title — checked here, not in evaluate(),
+        # so hard_gate stays a true necessary condition for the detail fetchers.
+        if not _SENIOR.search(title) and _match(title, ORBAG_PATTERNS):
+            hard += _match(title, LEVEL_PATTERNS)
+    if employment_type and _INTERN_TYPE.search(employment_type):
         hard.append("intern")
-    return hard
+    return list(dict.fromkeys(hard))
 
 
 def evaluate(title: str, description: str = "", employment_type: str = "") -> tuple[bool, list[str]]:
